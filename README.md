@@ -12,15 +12,23 @@ Only an actual click activates anything.
 
 ## Install
 
-1. Build it:
+Download the latest `.dmg` from [Releases](https://github.com/PirouzSR/ClickThrough/releases/latest),
+open it and drag **ClickThrough** to Applications. That build is ad-hoc signed
+and not notarized, so the first launch needs right-click › **Open** › Open.
+It is Apple silicon only; on Intel, build from source.
 
-   ```
+To build it yourself instead:
+
+1. ```
    ./scripts/build-release.sh
    ```
 
    (or open `ClickThrough.xcodeproj` in Xcode and build the `ClickThrough` scheme)
 
 2. Drag `build/ClickThrough.app` to `/Applications`.
+
+Either way, then:
+
 3. Launch it once. macOS will ask for Accessibility permission — grant it in
    System Settings › Privacy & Security › Accessibility.
 4. Done. It registers itself as a login item, so it starts automatically from
