@@ -76,11 +76,17 @@ race is easy to lose when the clicked window is on a second display, where
 activation is measurably slower — on a two-monitor setup, not waiting lost
 roughly one click in five. The wait has a hard time budget (200 ms, plus at most
 one Accessibility timeout) so a hung application can never stall the mouse or
-push the callback past the event tap's own one-second limit; in practice an
-activating click costs ~13 ms.
+push the callback past the event tap's own limit; in practice an activating
+click costs 13-30 ms. That limit was measured directly: the window server left
+the tap alone at 1000 ms and disabled it at 1500 ms.
 
 No synthetic clicks are ever generated, and no event is ever suppressed. That is
 what guarantees one physical click can never become two logical actions.
+
+If the system does disable the tap — which it does to any tap whose callback
+runs long — it delivers the "disabled" event only when the *next* event is
+routed, so a tap can sit disabled with no callback coming. A watchdog therefore
+re-arms it every second, which is the longest the utility can stay dead.
 
 ### Deliberate non-interference
 
@@ -90,21 +96,39 @@ A click is passed through untouched when:
   activating" and ⌃-click means "context menu"; both are left to macOS.
 * **A menu is open anywhere** (any window at the pop-up-menu level). A click
   then is a dismissal gesture, not an intent to activate something underneath.
-* **The pointer is outside the screen's visible frame** — the menu bar or the Dock.
-* **The frontmost application is system UI** — Mission Control, Launchpad, a Dock
-  menu, the login window or a screen saver.
+* **The pointer is on the menu bar**, taken from the window list: the window
+  server keeps a menu bar window only on a display that is actually showing one.
+* **The pointer is on the Dock**, taken from the frame the Dock reports for its
+  own row of items — which follows the Dock to the left or right edge, and sits
+  off the bottom of the display while it is hidden.
+* **The Dock is showing a stack** — the fan or grid from a folder in the Dock.
+  A click then belongs to the stack, not to whatever is behind the Dock.
+* **The frontmost application is system UI** — a Dock menu, the login window or
+  a screen saver — **or Mission Control is on screen**, which does not become
+  frontmost and so has to be recognised from its own windows.
 * **The topmost window under the pointer is not an ordinary window** — a panel,
   popover, tooltip, HUD or system overlay.
 * The window belongs to ClickThrough itself, or to a process that cannot be
   activated.
 
-Two window-server details the targeting has to allow for, both observed on
-macOS 27: **the Dock and Notification Centre each keep a window covering an
-entire display** above ordinary windows, and **the mouse pointer is itself a
-window**, directly under the cursor at all times. Treating either as "the
-window you clicked" would make the utility a silent no-op — intermittently, in
-Notification Centre's case. Any window above the ordinary level that spans a
-whole display is therefore treated as a backdrop and looked through.
+Three window-server details the targeting has to allow for, all observed on
+macOS 27:
+
+* **The Dock and Notification Centre each keep a window covering an entire
+  display** above ordinary windows, and **the mouse pointer is itself a window**,
+  directly under the cursor at all times. Treating any of those as "the window
+  you clicked" would make the utility a silent no-op — intermittently, in
+  Notification Centre's case. Any window above the ordinary level that spans a
+  whole display is therefore treated as a backdrop and looked through.
+* Looking through the Dock's backdrop is also why the Dock has to be asked about
+  its own clicks: everything it draws, the row of icons and any open stack
+  alike, lives inside that one window, and it never becomes frontmost. It is
+  only asked for a click that would otherwise activate something, and only when
+  its window covers that click — about 0.1 ms.
+* **`NSScreen.visibleFrame` reserves the menu bar and Dock strips permanently**,
+  on every display, whether or not either is on screen. A full-screen window
+  covers those strips, and a video player puts its controls exactly there, so
+  the strips are read from the window server and the Dock instead.
 
 ### Multiple displays
 
@@ -112,7 +136,9 @@ All geometry is handled in Core Graphics global coordinates — the same space
 used by both `CGEvent.location` and `kCGWindowBounds`. Displays at negative
 offsets, different resolutions and different scale factors therefore need no
 special handling. The display layout is re-read on screen-configuration changes
-and on wake.
+and on wake; the parts that move without one — which display is showing the
+menu bar, where the Dock is — are read per click from the window server and the
+Dock rather than cached.
 
 ## Permissions
 
@@ -137,9 +163,11 @@ granted, which it notices within a couple of seconds without needing a restart.
   be fixed this way, because the decision happens inside that app after the
   event is delivered. Pre-activation handles every standard AppKit view tested.
 * **Always-on-top windows** (floating panel level) are intentionally not targets.
-* The first click after the Dock is revealed from auto-hide may activate the
-  window behind it. The click still goes to the Dock — only the activation is
-  spurious.
+* **Mission Control is recognised from its own windows**, since it never becomes
+  the frontmost application. If a future macOS changes those windows, clicks
+  during Mission Control would go back to activating the window under the
+  pointer rather than being left alone — the check errs towards missing Mission
+  Control, because the opposite mistake would look like the utility was dead.
 
 ## Building and Gatekeeper
 

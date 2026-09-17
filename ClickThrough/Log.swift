@@ -13,7 +13,10 @@ enum Log {
     @inline(__always)
     static func debug(_ message: @autoclosure () -> String) {
         #if DEBUG
-        tap.debug("\(message(), privacy: .public)")
+        // Evaluated into a local first: os_log's interpolation is @escaping, and
+        // an @autoclosure parameter cannot be captured by an escaping closure.
+        let text = message()
+        tap.debug("\(text, privacy: .public)")
         #endif
     }
 }

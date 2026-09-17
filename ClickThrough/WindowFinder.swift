@@ -27,13 +27,14 @@ enum ClickAction: Equatable {
 enum IgnoreReason: String, Equatable {
     case modifierHeld
     case systemUIFrontmost
+    case systemUIOnScreen
     case menuOpen
-    case offScreen
     case menuBarOrDock
     case noWindowUnderCursor
     case overlayWindow
     case ownApplication
     case alreadyFrontWindow
+    case dockStackOpen
 }
 
 enum WindowFinder {
@@ -45,13 +46,22 @@ enum WindowFinder {
     /// Processes whose windows are never activation targets.
     ///
     /// `Window Server` owns the hardware pointer overlay, which sits at a very
-    /// high level *directly under the pointer at all times*, plus the menu bar
-    /// backdrop. `WindowManager` owns the wallpaper and Stage Manager surfaces.
-    static let nonTargetOwners: Set<String> = ["Window Server", "WindowManager"]
+    /// high level *directly under the pointer at all times*, plus the menu bar.
+    /// `WindowManager` owns the wallpaper, Stage Manager, and Mission Control.
+    static let windowServerOwnerName = "Window Server"
+    static let windowManagerOwnerName = "WindowManager"
+    static let nonTargetOwners: Set<String> = [windowServerOwnerName, windowManagerOwnerName]
+
+    /// `kCGWindowOwnerName` for the Dock. This is the process name, not a
+    /// localised display name, so it is stable across languages.
+    static let dockOwnerName = "Dock"
 
     /// Applications that, when frontmost, mean the system is showing its own UI
-    /// (Mission Control, Launchpad, a Dock menu, the login window, a screen saver).
-    /// Clicking through to an app underneath that UI is never what the user means.
+    /// (a Dock menu, the login window, a screen saver). Clicking through to an
+    /// app underneath that UI is never what the user means.
+    ///
+    /// Mission Control is deliberately *not* covered by this: it does not become
+    /// frontmost, and is recognised from the window list instead.
     static let systemUIBundleIDs: Set<String> = [
         "com.apple.dock",
         "com.apple.loginwindow",
@@ -100,13 +110,17 @@ enum WindowFinder {
     ///   - screens: current display layout.
     ///   - ownPID: this process, which must never activate itself.
     ///   - modifiers: modifier keys held at mouse-down.
+    ///   - dockState: asks the Dock what it is showing. Injected so that the
+    ///     whole policy stays a pure function, and only consulted for a click
+    ///     that would otherwise activate something.
     static func action(for point: CGPoint,
                        windows: [WindowSnapshot],
                        frontmostPID: pid_t,
                        frontmostIsSystemUI: Bool,
                        screens: [ScreenInfo],
                        ownPID: pid_t,
-                       modifiers: CGEventFlags) -> ClickAction {
+                       modifiers: CGEventFlags,
+                       dockState: (pid_t) -> DockState? = { _ in nil }) -> ClickAction {
         // Command-click and control-click already have their own meanings on an
         // inactive window (move it without activating; open a context menu), so
         // they are passed through untouched.
@@ -114,22 +128,47 @@ enum WindowFinder {
             return .ignore(.modifierHeld)
         }
 
-        // Mission Control, Launchpad, Dock menus, login window, screen saver.
+        // A Dock menu, the login window or a screen saver: the system has taken
+        // over, and clicking through to an application is never what is meant.
         if frontmostIsSystemUI { return .ignore(.systemUIFrontmost) }
+
+        // Mission Control. It is owned by `WindowManager`, and - measured on
+        // macOS 27 - it does *not* become the frontmost application, so the check
+        // above cannot see it; and it covers each display with a window above the
+        // ordinary level, which the backdrop rule further down would look
+        // straight past before activating whichever window lay under the pointer.
+        //
+        // It is recognised by two surfaces together, not one: a backdrop covering
+        // a display *and* the Spaces bar, a short strip across the full width of
+        // a display's top edge. The backdrop alone is not enough, because
+        // clicking the wallpaper leaves `WindowManager` holding an almost
+        // identical full-display window - and treating that as system UI would
+        // make the utility ignore every click until the user clicked a window
+        // again. Missing an unusual Mission Control simply leaves the old
+        // behaviour; a false positive here looks like the utility is dead, so the
+        // test deliberately errs towards missing one.
+        if isMissionControlOnScreen(windows, displays: screens.map(\.frame)) {
+            return .ignore(.systemUIOnScreen)
+        }
 
         // While a menu is being tracked anywhere on screen, a click is a dismissal
         // gesture. Activating whatever sits under the pointer would raise a window
         // the user never meant to touch.
         if windows.contains(where: { $0.layer == popUpMenuLayer }) { return .ignore(.menuOpen) }
 
-        guard let screen = screens.first(where: { $0.frame.contains(point) }) else {
-            return .ignore(.offScreen)
-        }
-        // Outside the visible frame means the menu bar or the Dock: leave both alone.
-        guard screen.visibleFrame.contains(point) else { return .ignore(.menuBarOrDock) }
+        let displays = screens.map(\.frame)
+
+        // The menu bar, wherever it is currently being drawn. This comes from the
+        // window list rather than from `NSScreen.visibleFrame` because macOS
+        // reserves the menu bar strip on *every* display permanently, while the
+        // window server only keeps a menu bar window where one is really on
+        // screen. The difference matters for a full-screen window, which covers
+        // the strip and makes the window go away: without this, clicks on the top
+        // edge of a full-screen video on a second display were being discarded.
+        if menuBar(at: point, in: windows, displays: displays) != nil { return .ignore(.menuBarOrDock) }
 
         guard let target = topmostTargetableWindow(at: point, in: windows,
-                                                  displays: screens.map(\.frame)) else {
+                                                  displays: displays) else {
             return .ignore(.noWindowUnderCursor)
         }
         // Anything above the ordinary window level is a panel, popover, tooltip,
@@ -143,6 +182,23 @@ enum WindowFinder {
         if isFrontApplication && appFrontWindow?.id == target.id {
             // Already the active window: macOS delivers this click normally.
             return .ignore(.alreadyFrontWindow)
+        }
+
+        // Everything the Dock draws - its strip of icons and any open stack -
+        // goes into one window covering the whole display, which the backdrop
+        // rule above deliberately looks past, and the Dock is not frontmost for
+        // either. Asking the Dock is the only way to tell a click on it from a
+        // click on the window behind it. See `DockInspector`.
+        if let dock = dockBackdrop(at: point, in: windows, displays: displays) {
+            if let state = dockState(dock.pid) {
+                if state.strip.contains(point) { return .ignore(.menuBarOrDock) }
+                if state.showsStack { return .ignore(.dockStackOpen) }
+            } else if let screen = screens.first(where: { $0.frame.contains(point) }),
+                      !screen.visibleFrame.contains(point) {
+                // The Dock did not answer. Fall back to the strip the display
+                // reserves, which is right for the ordinary always-visible Dock.
+                return .ignore(.menuBarOrDock)
+            }
         }
 
         // Raising is only needed when the click landed on a window that is not
@@ -172,11 +228,65 @@ enum WindowFinder {
 
     /// A window above the ordinary level that covers an entire display is a
     /// backdrop, not something the user clicked: the Dock and Notification
-    /// Centre both keep one permanently on screen, and screen-tinting utilities
-    /// add more. Treating one as the topmost window would make this utility
-    /// ignore every click for as long as it exists.
+    /// Centre each keep one on screen almost all of the time, and screen-tinting
+    /// utilities add more. Treating one as the topmost window would make this
+    /// utility ignore every click for as long as it exists.
+    ///
+    /// Looking past them is why the Dock has to be asked about its own clicks
+    /// separately, and why Mission Control is checked for by name above.
     private static func isBackdrop(_ window: WindowSnapshot, displays: [CGRect]) -> Bool {
         window.layer > 0 && displays.contains { window.bounds.contains($0) }
+    }
+
+    /// True while Mission Control is on screen.
+    ///
+    /// See the call site for why both surfaces are required.
+    private static func isMissionControlOnScreen(_ windows: [WindowSnapshot],
+                                                 displays: [CGRect]) -> Bool {
+        var hasBackdrop = false
+        var hasSpacesBar = false
+        for window in windows where window.ownerName == windowManagerOwnerName {
+            if isBackdrop(window, displays: displays) {
+                hasBackdrop = true
+            } else if window.layer > 0, displays.contains(where: {
+                $0.minY == window.bounds.minY && $0.width == window.bounds.width
+                    && window.bounds.height < $0.height
+            }) {
+                hasSpacesBar = true
+            }
+            if hasBackdrop && hasSpacesBar { return true }
+        }
+        return false
+    }
+
+    /// The menu bar window covering `point`, if the window server is drawing one
+    /// there right now.
+    ///
+    /// Identified by shape rather than by window level: the only window the window
+    /// server puts across the full width of a display's top edge is the menu bar.
+    /// That avoids depending on the level's numeric value, and the level is not
+    /// what makes it a menu bar anyway.
+    private static func menuBar(at point: CGPoint, in windows: [WindowSnapshot],
+                                displays: [CGRect]) -> WindowSnapshot? {
+        windows.first { window in
+            window.ownerName == windowServerOwnerName
+                && window.layer > 0
+                && window.bounds.contains(point)
+                && displays.contains { $0.minY == window.bounds.minY && $0.width == window.bounds.width }
+        }
+    }
+
+    /// The Dock's full-display window, when it is on screen and covers `point`.
+    ///
+    /// Its process identifier is what `DockInspector` needs, and taking it from
+    /// the window list means the Dock never has to be looked up by bundle
+    /// identifier on the event-tap thread.
+    private static func dockBackdrop(at point: CGPoint,
+                                     in windows: [WindowSnapshot],
+                                     displays: [CGRect]) -> WindowSnapshot? {
+        windows.first {
+            $0.ownerName == dockOwnerName && isBackdrop($0, displays: displays) && $0.bounds.contains(point)
+        }
     }
 
     /// The given application's front-most ordinary window, in global z-order.

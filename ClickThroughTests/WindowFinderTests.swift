@@ -32,16 +32,50 @@ final class WindowFinderTests: XCTestCase {
                layer: layer, alpha: alpha, owner: owner)
     }
 
+    /// The menu bar the window server draws on the primary display: a strip across
+    /// the full width of the display's top edge. Level 24 is what macOS uses, but
+    /// the policy recognises it by shape, not by level. Present in most fixtures
+    /// because it is present on a real system.
+    /// most fixtures because it is present on a real system.
+    private var primaryMenuBar: WindowSnapshot {
+        window(pid: 2, id: 900, rect: CGRect(x: 0, y: 0, width: 1512, height: 33),
+               layer: 24, owner: WindowFinder.windowServerOwnerName)
+    }
+
+    /// The menu bar on the secondary display.
+    private var secondaryMenuBar: WindowSnapshot {
+        window(pid: 2, id: 901, rect: CGRect(x: -200, y: -1080, width: 1920, height: 33),
+               layer: 24, owner: WindowFinder.windowServerOwnerName)
+    }
+
+    /// The Dock's full-display backdrop window, which is in the window list
+    /// whenever the Dock is on screen at all.
+    private var dockBackdrop: WindowSnapshot {
+        window(pid: 3, id: 902, rect: CGRect(x: 0, y: 0, width: 1512, height: 982),
+               layer: 20, owner: WindowFinder.dockOwnerName)
+    }
+
+    /// A window extending to the bottom edge of the primary display, so it lies
+    /// under the Dock the way a maximised window really does.
+    private var windowUnderTheDock: WindowSnapshot {
+        window(pid: otherPID, id: 2, rect: CGRect(x: 0, y: 33, width: 1512, height: 949))
+    }
+
+    /// The strip a bottom Dock occupies on the primary display.
+    private let dockStrip = CGRect(x: 56, y: 886, width: 1400, height: 86)
+
     private func act(_ point: CGPoint, _ windows: [WindowSnapshot],
                      frontmostPID: pid_t? = nil, frontmostIsSystemUI: Bool = false,
-                     modifiers: CGEventFlags = []) -> ClickAction {
+                     modifiers: CGEventFlags = [], dockStrip: CGRect = .null,
+                     dockShowsStack: Bool = false) -> ClickAction {
         WindowFinder.action(for: point,
                             windows: windows,
                             frontmostPID: frontmostPID ?? frontPID,
                             frontmostIsSystemUI: frontmostIsSystemUI,
                             screens: screens,
                             ownPID: ownPID,
-                            modifiers: modifiers)
+                            modifiers: modifiers,
+                            dockState: { _ in DockState(strip: dockStrip, showsStack: dockShowsStack) })
     }
 
     // MARK: - Core behaviour
@@ -89,19 +123,96 @@ final class WindowFinderTests: XCTestCase {
                        .activate(pid: otherPID, windowID: 2, windowBounds: onSecondary.bounds, raiseWindow: false))
     }
 
-    func testPointOnNoDisplayIsIgnored() {
+    func testPointOnNoDisplayFindsNoWindow() {
         let windows = [fullWindow(pid: otherPID, id: 2)]
-        XCTAssertEqual(act(CGPoint(x: 5000, y: 5000), windows), .ignore(.offScreen))
+        XCTAssertEqual(act(CGPoint(x: 5000, y: 5000), windows), .ignore(.noWindowUnderCursor))
     }
 
     func testMenuBarStripIsIgnored() {
-        let windows = [fullWindow(pid: otherPID, id: 2)]
+        let windows = [primaryMenuBar, dockBackdrop, fullWindow(pid: otherPID, id: 2)]
         XCTAssertEqual(act(CGPoint(x: 700, y: 10), windows), .ignore(.menuBarOrDock))
     }
 
+    func testMenuBarOnSecondaryDisplayIsIgnored() {
+        let onSecondary = window(pid: otherPID, id: 2,
+                                 rect: CGRect(x: -200, y: -1080, width: 1920, height: 400))
+        let windows = [secondaryMenuBar, onSecondary]
+        XCTAssertEqual(act(CGPoint(x: 700, y: -1070), windows), .ignore(.menuBarOrDock))
+    }
+
+    /// The Dock reports the strip it actually occupies; that is what decides a
+    /// Dock click, not the inset the display reserves.
     func testDockStripIsIgnored() {
-        let windows = [fullWindow(pid: otherPID, id: 2)]
-        XCTAssertEqual(act(CGPoint(x: 700, y: 950), windows), .ignore(.menuBarOrDock))
+        let windows = [primaryMenuBar, dockBackdrop, windowUnderTheDock]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 950), windows, dockStrip: dockStrip),
+                       .ignore(.menuBarOrDock))
+    }
+
+    /// An automatically hidden Dock leaves the display's visible frame at full
+    /// height, so the reserved-inset test cannot see it - but the Dock still
+    /// reports the strip it occupies once revealed, and a click there must not
+    /// reach the window behind it.
+    func testRevealedAutoHiddenDockIsIgnoredEvenWithNoReservedInset() {
+        let noInset = ScreenInfo(frame: primary.frame, visibleFrame: primary.frame)
+        let windows = [primaryMenuBar, dockBackdrop, windowUnderTheDock]
+        let action = WindowFinder.action(for: CGPoint(x: 700, y: 950),
+                                        windows: windows,
+                                        frontmostPID: frontPID,
+                                        frontmostIsSystemUI: false,
+                                        screens: [noInset, secondary],
+                                        ownPID: ownPID,
+                                        modifiers: [],
+                                        dockState: { _ in DockState(strip: self.dockStrip, showsStack: false) })
+        XCTAssertEqual(action, .ignore(.menuBarOrDock))
+    }
+
+    /// A hidden Dock reports a strip below the bottom of the display, so the same
+    /// click belongs to the window.
+    func testHiddenDockDoesNotSwallowClicks() {
+        let offScreenStrip = CGRect(x: 56, y: 982, width: 1400, height: 86)
+        let app = windowUnderTheDock
+        let windows = [primaryMenuBar, dockBackdrop, app]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 950), windows, dockStrip: offScreenStrip),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: app.bounds, raiseWindow: false))
+    }
+
+    /// If Accessibility does not answer, the reserved inset is still a reasonable
+    /// answer for the ordinary always-visible Dock.
+    func testDockStripFallsBackToTheReservedInsetWhenTheDockIsSilent() {
+        let windows = [primaryMenuBar, dockBackdrop, windowUnderTheDock]
+        let action = WindowFinder.action(for: CGPoint(x: 700, y: 950),
+                                        windows: windows,
+                                        frontmostPID: frontPID,
+                                        frontmostIsSystemUI: false,
+                                        screens: screens,
+                                        ownPID: ownPID,
+                                        modifiers: [],
+                                        dockState: { _ in nil })
+        XCTAssertEqual(action, .ignore(.menuBarOrDock))
+    }
+
+    /// A full-screen window covers the Dock, and macOS takes the Dock's window
+    /// out of the on-screen list for that display. The bottom strip is then part
+    /// of the window - where a video player keeps its controls - so the click
+    /// must be delivered rather than written off as a Dock click.
+    func testDockStripBelongsToAFullScreenWindowWhenTheDockIsNotOnScreen() {
+        let fullScreen = window(pid: otherPID, id: 2,
+                                rect: CGRect(x: 0, y: 33, width: 1512, height: 949))
+        let windows = [primaryMenuBar, fullScreen]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 950), windows),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: fullScreen.bounds,
+                                 raiseWindow: false))
+    }
+
+    /// Same again for the menu bar strip macOS reserves on every display: a
+    /// full-screen window on the secondary display covers it, and the window
+    /// server stops drawing a menu bar there.
+    func testReservedMenuBarStripBelongsToAFullScreenWindowOnASecondaryDisplay() {
+        let fullScreen = window(pid: otherPID, id: 2,
+                                rect: CGRect(x: -200, y: -1080, width: 1920, height: 1080))
+        XCTAssertEqual(act(CGPoint(x: 700, y: -1070), [fullScreen]),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: fullScreen.bounds,
+                                 raiseWindow: false))
     }
 
     // MARK: - System and special UI
@@ -110,6 +221,40 @@ final class WindowFinderTests: XCTestCase {
         let windows = [fullWindow(pid: otherPID, id: 2)]
         XCTAssertEqual(act(CGPoint(x: 700, y: 500), windows, frontmostIsSystemUI: true),
                        .ignore(.systemUIFrontmost))
+    }
+
+    /// Mission Control does not become the frontmost application, so it has to be
+    /// recognised from its own windows: a backdrop over the display plus the
+    /// Spaces bar across the top of it.
+    func testMissionControlIsRecognisedFromItsWindowsNotTheFrontmostApp() {
+        let backdrop = window(pid: 5, id: 910, rect: CGRect(x: 0, y: 0, width: 1512, height: 982),
+                              layer: 19, owner: WindowFinder.windowManagerOwnerName)
+        let spacesBar = window(pid: 5, id: 911, rect: CGRect(x: 0, y: 0, width: 1512, height: 128),
+                               layer: 14, owner: WindowFinder.windowManagerOwnerName)
+        let windows = [backdrop, spacesBar, dockBackdrop, fullWindow(pid: otherPID, id: 2)]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 500), windows), .ignore(.systemUIOnScreen))
+    }
+
+    /// Clicking the wallpaper leaves `WindowManager` holding a full-display window
+    /// that looks almost exactly like Mission Control's backdrop, and it stays
+    /// there. Taking it for system UI would make the utility ignore every click.
+    func testWallpaperFocusBackdropAloneDoesNotSuppressActivation() {
+        let backdrop = window(pid: 5, id: 910, rect: CGRect(x: 0, y: 0, width: 1512, height: 982),
+                              layer: 18, owner: WindowFinder.windowManagerOwnerName)
+        let app = fullWindow(pid: otherPID, id: 2)
+        let windows = [backdrop, dockBackdrop, app]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 500), windows),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: app.bounds, raiseWindow: false))
+    }
+
+    /// Stage Manager's strip is also owned by `WindowManager` but covers no
+    /// display, so it must not suppress anything.
+    func testWindowManagerStripDoesNotSuppressActivation() {
+        let strip = window(pid: 5, id: 911, rect: CGRect(x: 0, y: 100, width: 120, height: 600),
+                           layer: 19, owner: WindowFinder.windowManagerOwnerName)
+        let app = fullWindow(pid: otherPID, id: 2)
+        XCTAssertEqual(act(CGPoint(x: 700, y: 500), [strip, dockBackdrop, app]),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: app.bounds, raiseWindow: false))
     }
 
     func testOpenMenuAnywhereSuppressesActivation() {
@@ -164,6 +309,33 @@ final class WindowFinderTests: XCTestCase {
     func testOwnWindowsAreNeverActivated() {
         let mine = fullWindow(pid: ownPID, id: 60)
         XCTAssertEqual(act(CGPoint(x: 700, y: 500), [mine]), .ignore(.ownApplication))
+    }
+
+    /// A Dock stack - the fan from a folder in the Dock - is drawn inside the
+    /// Dock's own full-display window, and the Dock is not frontmost while one is
+    /// open. Clicking a file in the stack must not activate the window behind it.
+    func testClickIsLeftAloneWhileADockStackIsOpen() {
+        let windows = [primaryMenuBar, dockBackdrop, fullWindow(pid: otherPID, id: 2)]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 500), windows, dockShowsStack: true),
+                       .ignore(.dockStackOpen))
+    }
+
+    func testClickActivatesNormallyWhenNoDockStackIsOpen() {
+        let app = fullWindow(pid: otherPID, id: 2)
+        let windows = [primaryMenuBar, dockBackdrop, app]
+        XCTAssertEqual(act(CGPoint(x: 700, y: 500), windows, dockShowsStack: false),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: app.bounds, raiseWindow: false))
+    }
+
+    /// The Dock only covers its own display, so an open stack there cannot be a
+    /// reason to suppress a click on a different display.
+    func testDockStackDoesNotSuppressClicksOnAnotherDisplay() {
+        let onSecondary = window(pid: otherPID, id: 2,
+                                 rect: CGRect(x: -100, y: -900, width: 800, height: 600))
+        let windows = [primaryMenuBar, dockBackdrop, onSecondary]
+        XCTAssertEqual(act(CGPoint(x: 100, y: -600), windows, dockShowsStack: true),
+                       .activate(pid: otherPID, windowID: 2, windowBounds: onSecondary.bounds,
+                                 raiseWindow: false))
     }
 
     // MARK: - Modifiers

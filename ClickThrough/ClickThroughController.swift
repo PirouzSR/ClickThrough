@@ -15,6 +15,9 @@ final class ClickThroughController: @unchecked Sendable {
 
     private static let enabledDefaultsKey = "ClickThroughEnabled"
 
+    /// How long the utility may stay dead after the system disables the tap.
+    private static let watchdogInterval: TimeInterval = 1
+
     private let environment = OSAllocatedUnfairLock(initialState: Environment())
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private var tap: EventTap?
@@ -43,9 +46,10 @@ final class ClickThroughController: @unchecked Sendable {
         refreshScreens()
         observeSystemChanges()
 
-        // Pay the window-server connection setup cost now rather than on the
-        // user's first click (~50 ms the first time, ~2 ms thereafter).
+        // Pay the window-server and Dock connection setup costs now rather than
+        // on the user's first click.
         WindowFinder.warmUp()
+        DockInspector.warmUp()
     }
 
     deinit {
@@ -89,7 +93,8 @@ final class ClickThroughController: @unchecked Sendable {
                                          frontmostIsSystemUI: snapshot.frontmostIsSystemUI,
                                          screens: snapshot.screens,
                                          ownPID: ownPID,
-                                         modifiers: event.flags)
+                                         modifiers: event.flags,
+                                         dockState: DockInspector.state)
 
         switch action {
         case .ignore(let reason):
@@ -113,18 +118,27 @@ final class ClickThroughController: @unchecked Sendable {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged(_:)),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        // Belt and braces. This covers two failure modes that would otherwise
-        // leave the utility silently dead until the user restarts it: a tap the
-        // system disabled without the callback being told, and a tap that could
-        // not be created at all - which happens if the app starts before the
-        // window server session is ready, as it can at login.
-        let watchdog = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
+        // Belt and braces, and the only thing that recovers two failure modes
+        // that would otherwise leave the utility silently dead: a tap the system
+        // disabled without the callback ever being told, and a tap that could not
+        // be created at all - which happens if the app starts before the window
+        // server session is ready, as it can at login.
+        //
+        // Measured on macOS: the window server disables a tap whose callback
+        // takes longer than about a second, and delivers the disabled event only
+        // when the *next* event is routed. So a tap can sit disabled with no
+        // callback coming, and the interval here is exactly how long the utility
+        // stays dead when that happens. `CGEvent.tapIsEnabled` is a cheap query
+        // and the tolerance lets the system coalesce the wake-up, so checking
+        // every second costs effectively nothing.
+        let watchdog = Timer(timeInterval: Self.watchdogInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.tap?.reenableIfNeeded()
             if self.isEnabled, self.tap?.isRunning == false {
                 self.syncTapState()
             }
         }
+        watchdog.tolerance = Self.watchdogInterval
         RunLoop.main.add(watchdog, forMode: .common)
         self.watchdog = watchdog
     }
