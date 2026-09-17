@@ -113,10 +113,17 @@ final class ClickThroughController: @unchecked Sendable {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged(_:)),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        // Belt and braces: taps can also be disabled without the tap thread being
-        // told, for example around some system UI transitions.
-        let watchdog = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
-            self?.tap?.reenableIfNeeded()
+        // Belt and braces. This covers two failure modes that would otherwise
+        // leave the utility silently dead until the user restarts it: a tap the
+        // system disabled without the callback being told, and a tap that could
+        // not be created at all - which happens if the app starts before the
+        // window server session is ready, as it can at login.
+        let watchdog = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.tap?.reenableIfNeeded()
+            if self.isEnabled, self.tap?.isRunning == false {
+                self.syncTapState()
+            }
         }
         RunLoop.main.add(watchdog, forMode: .common)
         self.watchdog = watchdog

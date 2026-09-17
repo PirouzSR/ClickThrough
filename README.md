@@ -61,12 +61,23 @@ A `CGEventTap` watches left mouse-down. For each one:
 2. If that window's application is already frontmost and the window is already
    its front window, do nothing.
 3. Otherwise activate that application — raising the specific clicked window
-   first if it is not already that application's front window — and then return
-   **the original event, unmodified**.
+   first if it is not already that application's front window — wait until the
+   application reports that it really is frontmost, and then return **the
+   original event, unmodified**.
 
 The application therefore receives the user's real click at a moment when it is
 already active, so AppKit delivers it to the view instead of swallowing it as an
 activation click.
+
+Step 3 has to wait, not just ask. `activate()` only *requests* activation; if
+the held mouse-down is released before the application has actually become
+active, AppKit still treats it as the activating click and discards it. That
+race is easy to lose when the clicked window is on a second display, where
+activation is measurably slower — on a two-monitor setup, not waiting lost
+roughly one click in five. The wait has a hard time budget (200 ms, plus at most
+one Accessibility timeout) so a hung application can never stall the mouse or
+push the callback past the event tap's own one-second limit; in practice an
+activating click costs ~13 ms.
 
 No synthetic clicks are ever generated, and no event is ever suppressed. That is
 what guarantees one physical click can never become two logical actions.

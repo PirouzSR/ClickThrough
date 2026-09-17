@@ -28,9 +28,11 @@ reasonable-sounding assumptions.
 | IINA: one click on the OSC pause button of an inactive window | Activated and paused exactly once; playback clock frozen, verified via IINA's own clock |
 | ⌘-click on an inactive window | Not activated; macOS's own click-through behaviour preserved |
 | ⌃-click on an inactive window | Passed through unchanged |
-| Event tap latency, warm | ~1 ms (window list ~2 ms median; first call ~50 ms, so it is warmed up at launch) |
+| Event tap latency, warm | ~1 ms to decide; ~13 ms median for a click that activates another app |
+| **Two displays, click a window on either monitor, 20 clicks each way** | **20/20 delivered.** Before the activation-wait fix: 17/20 and 16/20 |
+| Busy 20-window app, clicking its background windows | No tap disables; worst callback ~274 ms, well inside the 1 s tap limit |
 
-Two findings changed the implementation:
+Three findings changed the implementation:
 
 1. The Dock owns a transparent window spanning the whole display, and the mouse
    cursor is itself a window under the pointer. A naive topmost-window-under-
@@ -40,6 +42,13 @@ Two findings changed the implementation:
    does IINA's pause button. The wasted first click is real for plain and custom
    views, not for stock controls — so the utility's value is narrower than the
    folklore suggests, and correctness around *not* misfiring matters more.
+3. Requesting activation is not enough. `NSRunningApplication.activate()`
+   returns immediately, and if the held mouse-down is released before the
+   application has actually become active, AppKit still discards it as the
+   activating click. With one display the race was almost always won, which is
+   why it went unnoticed; with two displays it was lost about one click in five.
+   The activation is now confirmed before the event is released, within a hard
+   time budget.
 
 An earlier experiment also confirmed that synthetic clicks are unnecessary:
 swallowing the original event and re-posting it after activation worked, but so
