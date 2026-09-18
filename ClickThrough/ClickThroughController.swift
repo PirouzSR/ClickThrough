@@ -87,8 +87,9 @@ final class ClickThroughController: @unchecked Sendable {
 
     private func handleMouseDown(_ event: CGEvent) {
         let snapshot = environment.withLock { $0 }
+        let windows = WindowFinder.onScreenWindows()
         let action = WindowFinder.action(for: event.location,
-                                         windows: WindowFinder.onScreenWindows(),
+                                         windows: windows,
                                          frontmostPID: snapshot.frontmostPID,
                                          frontmostIsSystemUI: snapshot.frontmostIsSystemUI,
                                          screens: snapshot.screens,
@@ -101,7 +102,8 @@ final class ClickThroughController: @unchecked Sendable {
             Log.debug("ignore(\(reason.rawValue)) at \(event.location)")
         case .activate(let pid, let windowID, let bounds, let raiseWindow):
             Log.debug("activate pid=\(pid) window=\(windowID) raise=\(raiseWindow) at \(event.location)")
-            WindowActivator.activate(pid: pid, windowBounds: bounds, raiseWindow: raiseWindow)
+            WindowActivator.activate(pid: pid, windowBounds: bounds, raiseWindow: raiseWindow,
+                                     windows: windows, displays: snapshot.screens.map(\.frame))
         }
         // The caller returns the original event either way.
     }

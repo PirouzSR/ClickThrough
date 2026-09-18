@@ -41,6 +41,74 @@ printf '<plist version="1.0"><dict><key>CFBundleExecutable</key><string>ClickThr
 DYLD_FRAMEWORK_PATH=$XCF DYLD_LIBRARY_PATH=/tmp/ct $XC/usr/bin/xctest $B
 ```
 
+
+## Third round: the multi-display case the utility was actually for
+
+Reported: with an editor on the laptop display and a browser window on the
+external one, clicking the browser did nothing except bring the browser's
+*other* window forward over the editor. Both halves of that were real, and the
+second half was caused by this utility.
+
+The cause is what activation does. `NSRunningApplication.activate()` does not
+just make an application frontmost; the application then focuses and raises
+*its own* last-used window. For a browser holding a window on each display that
+window is the one on the other display, so:
+
+- the raise this utility had just performed on the clicked window was thrown
+  away, the clicked window was not the focused one when the mouse-down was
+  released, and the click was discarded exactly as if nothing were running;
+- the browser's window on the *other* display was raised over whatever the user
+  had there.
+
+Six strategies were measured against a real browser window on the external
+display, with the browser's laptop-side window as its main window, the user in
+another application, and the click counted by the page itself:
+
+| strategy | click delivered | other display disturbed |
+|---|---|---|
+| stock macOS, nothing running | 0/8 | 0/8 |
+| raise, then activate (what 1.1.0 did) | 0/8 | 8/8 |
+| raise only, never activate | 0/8 | 0/8 |
+| set `AXFocused` on the window, no activate | 0/6 | 0/6 |
+| set `AXFocused`, then make the app frontmost | 0/8 | 8/8 |
+| set `AXMain` on the window, then activate | 1/8 | 7/8 |
+| raise, activate, raise again | 6/8 | 7/8 |
+| raise, activate, raise again, restore the other display once | 4/8 | 6/8 |
+| **raise, activate, raise again, restore repeatedly** | **8/8** | **0/8** |
+
+Two things had to be true at once, and each needed its own fix:
+
+1. **Raise again after activating.** Anything done before the activation is
+   discarded by the application's own window handling. Raising once more
+   afterwards is what makes the clicked window the focused one in time.
+2. **Put back what the activation displaced.** For every display other than the
+   clicked one, the window that was on top there is raised again - immediately
+   and then at 40, 130 and 310 ms, because the application raises its own window
+   slightly *after* it is activated, so a single attempt loses the race.
+   Raising a window does not change which application is active, so this does
+   not undo the activation the click depends on.
+
+The utility also now waits for the *clicked window* to be the application's
+focused window rather than merely for the application to be frontmost.
+`kAXFrontmost` goes true while the application is still settling, which is why
+the previous version reported success on every one of the clicks it lost.
+
+Measured after the fix, with the real engine: **10/10 delivered, 0/10 other
+displays disturbed**, focus confirmed on every click, worst callback 25 ms.
+Cross-display delivery against a plain `NSView` probe went from 0/5 to 6/6 in
+both directions, with fast clicks and drags at 4/4, and no tap disables.
+
+### A measurement trap worth recording
+
+The first pass through this investigation concluded the opposite - that the
+utility worked and stock macOS was the one raising windows. That was wrong, and
+the cause was leaked test processes: each experiment installed its own event tap
+and `pkill` with a path pattern never matched them, so twenty-one taps
+accumulated, every one of them activating applications on each click. Any
+measurement of "what happens on a click" is meaningless without first checking
+what else is tapping. `CGGetEventTapList` reports every tap in the session with
+its owning process, and is now the first thing to check.
+
 ## Second round: edge cases found after release
 
 Reported symptoms were (a) the utility occasionally stopping completely while

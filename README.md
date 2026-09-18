@@ -69,17 +69,38 @@ The application therefore receives the user's real click at a moment when it is
 already active, so AppKit delivers it to the view instead of swallowing it as an
 activation click.
 
-Step 3 has to wait, not just ask. `activate()` only *requests* activation; if
-the held mouse-down is released before the application has actually become
-active, AppKit still treats it as the activating click and discards it. That
-race is easy to lose when the clicked window is on a second display, where
-activation is measurably slower — on a two-monitor setup, not waiting lost
-roughly one click in five. The wait has a hard time budget (200 ms, plus at most
-one Accessibility timeout) so a hung application can never stall the mouse or
-push the callback past the event tap's own limit; in practice an activating
-click costs 13-30 ms. That limit was measured directly: the window server left
-the tap alone at 1000 ms and disabled it at 1500 ms.
+Step 3 has to do three things, not one, and each was found the hard way.
 
+**Wait, do not just ask.** `activate()` only *requests* activation; if the held
+mouse-down is released before the application has actually become active,
+AppKit still treats it as the activating click and discards it. The wait has a
+hard time budget (200 ms, plus at most one Accessibility timeout) so a hung
+application can never stall the mouse or push the callback past the event tap's
+own limit. That limit was measured directly: the window server left the tap
+alone at 1000 ms and disabled it at 1500 ms.
+
+**Wait for the right thing.** Waiting for the application to report
+`kAXFrontmost` is not enough - it goes true while the application is still
+settling. What matters is that the *clicked window* is the one the application
+has focused, so that is what is waited for.
+
+**Raise the clicked window again afterwards.** Activating an application makes
+it focus and raise its own last-used window, which throws away any raise
+performed beforehand. For an application with a window on each display that
+window is on the *other* display, so before this the clicked window was not
+focused when the click was released and the click was lost - measured at 0 out
+of 8 for a browser in that arrangement, the same as not running at all.
+
+**Put back what the activation displaced.** Activation raises an application's
+windows on every display, not only the one being clicked, so a window the user
+was working in on another display would vanish behind a window of the
+application they clicked elsewhere. Nothing about the click asked for that.
+For every display other than the clicked one, the window that was on top is
+raised again - immediately, and again at 40, 130 and 310 ms, because the
+application raises its own window slightly after being activated. Raising a
+window does not change which application is active, so this does not undo the
+activation. Measured together: 10 clicks out of 10 delivered, 0 out of 10 with
+another display disturbed; in practice an activating click costs 13-40 ms.
 No synthetic clicks are ever generated, and no event is ever suppressed. That is
 what guarantees one physical click can never become two logical actions.
 

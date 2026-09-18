@@ -24,13 +24,35 @@ enum WindowActivator {
     /// exactly for standard windows, so this only absorbs rounding.
     private static let frameMatchTolerance: CGFloat = 2
 
-    /// Activates `pid`, optionally making the specific clicked window the front
-    /// window of that application first, and waits for the activation to take
-    /// effect before returning.
+    /// A window that was on top of its display before an activation, so that it
+    /// can be put back if the activation displaced it.
+    struct DisplacedWindow: Sendable {
+        let pid: pid_t
+        let bounds: CGRect
+    }
+
+    /// Queue used to put displaced windows back, off the event-tap thread.
+    private static let restoreQueue = DispatchQueue(label: "com.clickthrough.restore",
+                                                    qos: .userInitiated)
+
+    /// When to retry putting a displaced window back. An application raises its
+    /// own last-used window slightly *after* it is activated, so a single
+    /// immediate attempt loses the race; these were measured to be enough.
+    private static let restoreDelays: [DispatchTimeInterval] =
+        [.milliseconds(40), .milliseconds(130), .milliseconds(310)]
+
+    /// Activates `pid`, makes the specific clicked window the one the application
+    /// has focused, and waits for that to take effect before returning.
     ///
     /// The caller then returns the original `CGEvent` unmodified, so the target
     /// receives the user's actual click - no synthetic event is ever generated.
-    static func activate(pid: pid_t, windowBounds: CGRect, raiseWindow: Bool) {
+    ///
+    /// - Parameters:
+    ///   - windows: the on-screen window list already read for the click, used to
+    ///     notice windows on *other* displays that activation may displace.
+    ///   - displays: current display frames.
+    static func activate(pid: pid_t, windowBounds: CGRect, raiseWindow: Bool,
+                         windows: [WindowSnapshot], displays: [CGRect]) {
         let deadline = CFAbsoluteTimeGetCurrent() + activationBudget
 
         // The window may have belonged to a process that has since exited.
@@ -43,6 +65,9 @@ enum WindowActivator {
             Log.debug("activate: pid \(pid) has prohibited activation policy")
             return
         }
+
+        let displaced = windowsActivationWouldDisplace(targetPID: pid, clicked: windowBounds,
+                                                       windows: windows, displays: displays)
 
         let element = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
@@ -62,11 +87,75 @@ enum WindowActivator {
             Log.debug("activate: NSRunningApplication refused, AXFrontmost -> \(result.rawValue)")
         }
 
-        waitUntilFrontmost(element, deadline: deadline)
+        // Raise again, after activating. Measured on macOS with a browser holding
+        // a window on each display: activation makes the application focus and
+        // raise *its own* last-used window, throwing away the raise above. The
+        // clicked window then is not the focused one when the mouse-down is
+        // released, and the click is swallowed exactly as if this utility were
+        // not running - 0 clicks delivered out of 8. Raising once more after
+        // activation took that to 8 out of 8.
+        if raiseWindow {
+            raise(windowWithBounds: windowBounds, in: element, deadline: deadline)
+        }
+
+        waitUntilReady(element, windowBounds: windowBounds, deadline: deadline)
+        restore(displaced)
     }
 
-    /// Blocks until the target application reports that it is frontmost, or the
-    /// budget runs out.
+    /// Windows that activating `targetPID` is likely to cover up, and should not.
+    ///
+    /// Activating an application raises its windows on *every* display, not just
+    /// the one being clicked. On a second display that means a window the user
+    /// was working in - an editor, say - suddenly disappears behind a window of
+    /// the application they clicked on the other screen. Nothing about the click
+    /// asked for that, and stock macOS does not do it: it simply discards the
+    /// click instead.
+    ///
+    /// Only the top-most window of each *other* display is considered, and only
+    /// when it belongs to some other application and the target actually has a
+    /// window on that display to be raised over it.
+    private static func windowsActivationWouldDisplace(targetPID: pid_t, clicked: CGRect,
+                                                       windows: [WindowSnapshot],
+                                                       displays: [CGRect]) -> [DisplacedWindow] {
+        let clickedDisplay = displays.first { $0.intersects(clicked) }
+        var result: [DisplacedWindow] = []
+        for display in displays where display != clickedDisplay {
+            let onThisDisplay = windows.filter { $0.layer == 0 && $0.alpha > 0 && display.intersects($0.bounds) }
+            guard let top = onThisDisplay.first, top.pid != targetPID,
+                  onThisDisplay.contains(where: { $0.pid == targetPID })
+            else { continue }
+            result.append(DisplacedWindow(pid: top.pid, bounds: top.bounds))
+        }
+        return result
+    }
+
+    /// Puts displaced windows back on top of their own display.
+    ///
+    /// Raising a window does not change which application is active - verified -
+    /// so this does not undo the activation that the click depends on. It runs
+    /// once immediately and again a few times shortly afterwards, because the
+    /// application does its own raising just after being activated.
+    private static func restore(_ displaced: [DisplacedWindow]) {
+        guard !displaced.isEmpty else { return }
+        raiseEach(displaced)
+        var elapsed = DispatchTime.now()
+        for delay in restoreDelays {
+            elapsed = elapsed + delay
+            restoreQueue.asyncAfter(deadline: elapsed) { raiseEach(displaced) }
+        }
+    }
+
+    private static func raiseEach(_ displaced: [DisplacedWindow]) {
+        for window in displaced {
+            let app = AXUIElementCreateApplication(window.pid)
+            AXUIElementSetMessagingTimeout(app, axMessagingTimeout)
+            raise(windowWithBounds: window.bounds, in: app,
+                  deadline: CFAbsoluteTimeGetCurrent() + activationBudget)
+        }
+    }
+
+    /// Blocks until the application is frontmost *and* the clicked window is the
+    /// one it has focused, or the budget runs out.
     ///
     /// This is the difference between the click landing and being swallowed.
     /// `activate` only *requests* activation; if the held mouse-down is released
@@ -74,16 +163,61 @@ enum WindowActivator {
     /// as the click that activates the window and discards it. The race is easy
     /// to lose when the window is on a second display, where activation is
     /// measurably slower.
-    private static func waitUntilFrontmost(_ element: AXUIElement, deadline: CFTimeInterval) {
+    ///
+    /// Waiting for `kAXFrontmost` alone is not enough, and that is what made this
+    /// fail for a browser with a window on each display. `kAXFrontmost` goes true
+    /// while the application is still settling, and an application activated from
+    /// the background focuses *its own* idea of the front window first - which,
+    /// for a browser, is whichever window was last used, not the one just
+    /// clicked. Releasing the mouse-down then delivers it to a window that is not
+    /// focused, and it is swallowed exactly as before. Measured on macOS: waiting
+    /// only for frontmost delivered 0 clicks out of 8 in that setup.
+    private static func waitUntilReady(_ element: AXUIElement, windowBounds: CGRect,
+                                       deadline: CFTimeInterval) {
+        var sawFrontmost = false
         while CFAbsoluteTimeGetCurrent() < deadline {
-            var value: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXFrontmostAttribute as CFString, &value) == .success,
-               (value as? Bool) == true {
-                return
+            if !sawFrontmost {
+                var value: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXFrontmostAttribute as CFString, &value) == .success,
+                   (value as? Bool) == true {
+                    sawFrontmost = true
+                }
             }
+            if sawFrontmost, focusedWindowMatches(windowBounds, in: element) { return }
             usleep(confirmationPollInterval)
         }
-        Log.debug("activate: target did not report frontmost within budget")
+        Log.debug("activate: target not ready within budget (frontmost: \(sawFrontmost))")
+    }
+
+    /// True when the application's focused window is the one that was clicked.
+    private static func focusedWindowMatches(_ bounds: CGRect, in app: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
+              let window = value, CFGetTypeID(window) == AXUIElementGetTypeID()
+        else { return false }
+        guard let frame = frame(of: window as! AXUIElement) else { return false }
+        return abs(frame.minX - bounds.minX) <= frameMatchTolerance
+            && abs(frame.minY - bounds.minY) <= frameMatchTolerance
+            && abs(frame.width - bounds.width) <= frameMatchTolerance
+            && abs(frame.height - bounds.height) <= frameMatchTolerance
+    }
+
+    /// An Accessibility window's frame, in one round trip.
+    private static func frame(of window: AXUIElement) -> CGRect? {
+        var values: CFArray?
+        let attributes = [kAXPositionAttribute, kAXSizeAttribute] as CFArray
+        guard AXUIElementCopyMultipleAttributeValues(window, attributes, [], &values) == .success,
+              let pair = values as? [AnyObject], pair.count == 2,
+              CFGetTypeID(pair[0]) == AXValueGetTypeID(), CFGetTypeID(pair[1]) == AXValueGetTypeID()
+        else { return nil }
+        let position = pair[0] as! AXValue
+        let size = pair[1] as! AXValue
+        guard AXValueGetType(position) == .cgPoint, AXValueGetType(size) == .cgSize else { return nil }
+        var origin = CGPoint.zero
+        var extent = CGSize.zero
+        AXValueGetValue(position, .cgPoint, &origin)
+        AXValueGetValue(size, .cgSize, &extent)
+        return CGRect(origin: origin, size: extent)
     }
 
     /// Finds the target application's Accessibility window whose frame matches the
@@ -103,7 +237,6 @@ enum WindowActivator {
             return
         }
 
-        let attributes = [kAXPositionAttribute, kAXSizeAttribute] as CFArray
         for window in windows {
             // A busy application answers slowly; with many windows the search
             // alone could outlast the tap timeout, so give up and settle for
@@ -112,23 +245,13 @@ enum WindowActivator {
                 Log.debug("activate: window search ran out of budget")
                 return
             }
-            var values: CFArray?
             // One round trip per window instead of two.
-            guard AXUIElementCopyMultipleAttributeValues(window, attributes, [], &values) == .success,
-                  let pair = values as? [AnyObject], pair.count == 2,
-                  CFGetTypeID(pair[0]) == AXValueGetTypeID(), CFGetTypeID(pair[1]) == AXValueGetTypeID()
-            else { continue }
+            guard let r = frame(of: window) else { continue }
 
-            var origin = CGPoint.zero
-            var size = CGSize.zero
-            // Safe: the CFGetTypeID checks above confirmed both are AXValues.
-            AXValueGetValue(pair[0] as! AXValue, .cgPoint, &origin)
-            AXValueGetValue(pair[1] as! AXValue, .cgSize, &size)
-
-            if abs(origin.x - bounds.minX) <= frameMatchTolerance,
-               abs(origin.y - bounds.minY) <= frameMatchTolerance,
-               abs(size.width - bounds.width) <= frameMatchTolerance,
-               abs(size.height - bounds.height) <= frameMatchTolerance {
+            if abs(r.minX - bounds.minX) <= frameMatchTolerance,
+               abs(r.minY - bounds.minY) <= frameMatchTolerance,
+               abs(r.width - bounds.width) <= frameMatchTolerance,
+               abs(r.height - bounds.height) <= frameMatchTolerance {
                 AXUIElementPerformAction(window, kAXRaiseAction as CFString)
                 return
             }
