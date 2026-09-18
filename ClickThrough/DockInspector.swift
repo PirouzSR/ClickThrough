@@ -63,7 +63,7 @@ enum DockInspector {
         guard let children = pair[1] as? [AXUIElement], let items = children.first else {
             return DockState(strip: .null, showsStack: showsStack)
         }
-        return DockState(strip: frame(of: items) ?? .null, showsStack: showsStack)
+        return DockState(strip: items.frame ?? .null, showsStack: showsStack)
     }
 
     /// The first Accessibility round trip to a process costs ~25 ms while the
@@ -73,24 +73,5 @@ enum DockInspector {
         guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: dockBundleID).first
         else { return }
         _ = state(pid: dock.processIdentifier)
-    }
-
-    private static func frame(of element: AXUIElement) -> CGRect? {
-        var values: CFArray?
-        let wanted = [kAXPositionAttribute, kAXSizeAttribute] as CFArray
-        guard AXUIElementCopyMultipleAttributeValues(element, wanted, [], &values) == .success,
-              let pair = values as? [AnyObject], pair.count == 2,
-              CFGetTypeID(pair[0]) == AXValueGetTypeID(), CFGetTypeID(pair[1]) == AXValueGetTypeID()
-        else { return nil }
-
-        let position = pair[0] as! AXValue
-        let size = pair[1] as! AXValue
-        guard AXValueGetType(position) == .cgPoint, AXValueGetType(size) == .cgSize else { return nil }
-
-        var origin = CGPoint.zero
-        var extent = CGSize.zero
-        AXValueGetValue(position, .cgPoint, &origin)
-        AXValueGetValue(size, .cgSize, &extent)
-        return CGRect(origin: origin, size: extent)
     }
 }

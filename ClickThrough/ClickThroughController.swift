@@ -46,10 +46,11 @@ final class ClickThroughController: @unchecked Sendable {
         refreshScreens()
         observeSystemChanges()
 
-        // Pay the window-server and Dock connection setup costs now rather than
-        // on the user's first click.
+        // Pay the window-server and Accessibility connection setup costs now
+        // rather than on the user's first click.
         WindowFinder.warmUp()
         DockInspector.warmUp()
+        NotificationCenterInspector.warmUp()
     }
 
     deinit {
@@ -106,7 +107,8 @@ final class ClickThroughController: @unchecked Sendable {
                                          screens: snapshot.screens,
                                          ownPID: ownPID,
                                          modifiers: event.flags,
-                                         dockState: DockInspector.state)
+                                         dockState: DockInspector.state,
+                                         notificationRects: NotificationCenterInspector.contentRects(pid:window:))
 
         switch action {
         case .ignore(let reason):

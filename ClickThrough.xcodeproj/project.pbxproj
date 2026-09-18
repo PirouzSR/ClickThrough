@@ -18,7 +18,9 @@
 		1A0000000000000000000209 /* WindowActivator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000109 /* WindowActivator.swift */; };
 		1A000000000000000000020A /* WindowFinder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000010A /* WindowFinder.swift */; };
 		1A000000000000000000020D /* DockInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000010D /* DockInspector.swift */; };
-		1A000000000000000000020B /* WindowFinderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000010D /* WindowFinderTests.swift */; };
+		1A000000000000000000020E /* NotificationCenterInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000010F /* NotificationCenterInspector.swift */; };
+		1A000000000000000000020F /* AXUIElement+Frame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000110 /* AXUIElement+Frame.swift */; };
+		1A000000000000000000020B /* WindowFinderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000111 /* WindowFinderTests.swift */; };
 		1A000000000000000000020C /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000010E /* main.swift */; };
 /* End PBXBuildFile section */
 
@@ -46,9 +48,11 @@
 		1A0000000000000000000109 /* WindowActivator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowActivator.swift; sourceTree = "<group>"; };
 		1A000000000000000000010A /* WindowFinder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowFinder.swift; sourceTree = "<group>"; };
 		1A000000000000000000010D /* DockInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DockInspector.swift; sourceTree = "<group>"; };
+		1A000000000000000000010F /* NotificationCenterInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationCenterInspector.swift; sourceTree = "<group>"; };
+		1A0000000000000000000110 /* AXUIElement+Frame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AXUIElement+Frame.swift"; sourceTree = "<group>"; };
 		1A000000000000000000010B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A000000000000000000010C /* ClickThrough.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ClickThrough.entitlements; sourceTree = "<group>"; };
-		1A000000000000000000010D /* WindowFinderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowFinderTests.swift; sourceTree = "<group>"; };
+		1A0000000000000000000111 /* WindowFinderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowFinderTests.swift; sourceTree = "<group>"; };
 		1A000000000000000000010E /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -97,6 +101,8 @@
 				1A0000000000000000000104 /* EventTap.swift */,
 				1A000000000000000000010A /* WindowFinder.swift */,
 				1A000000000000000000010D /* DockInspector.swift */,
+				1A000000000000000000010F /* NotificationCenterInspector.swift */,
+				1A0000000000000000000110 /* AXUIElement+Frame.swift */,
 				1A0000000000000000000109 /* WindowActivator.swift */,
 				1A0000000000000000000107 /* ScreenGeometry.swift */,
 				1A0000000000000000000108 /* StatusBarController.swift */,
@@ -112,7 +118,7 @@
 		1A0000000000000000000005 /* ClickThroughTests */ = {
 			isa = PBXGroup;
 			children = (
-				1A000000000000000000010D /* WindowFinderTests.swift */,
+				1A0000000000000000000111 /* WindowFinderTests.swift */,
 			);
 			path = ClickThroughTests;
 			sourceTree = "<group>";
@@ -220,6 +226,8 @@
 				1A0000000000000000000204 /* EventTap.swift in Sources */,
 				1A000000000000000000020A /* WindowFinder.swift in Sources */,
 				1A000000000000000000020D /* DockInspector.swift in Sources */,
+				1A000000000000000000020E /* NotificationCenterInspector.swift in Sources */,
+				1A000000000000000000020F /* AXUIElement+Frame.swift in Sources */,
 				1A0000000000000000000209 /* WindowActivator.swift in Sources */,
 				1A0000000000000000000207 /* ScreenGeometry.swift in Sources */,
 				1A0000000000000000000208 /* StatusBarController.swift in Sources */,

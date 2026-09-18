@@ -3,15 +3,25 @@
 ## Automated
 
 `ClickThroughTests/WindowFinderTests.swift` covers the click policy, which is a
-pure function and therefore testable without a window server. 35 tests: active
-vs inactive windows, background windows of the active and of an inactive
-application, negative-coordinate secondary displays, the menu bar on either
-display, the Dock strip (ordinary, auto-hidden, hidden, and when Accessibility
-does not answer), the strips a full-screen window covers, open menus, floating
-panels, the Dock backdrop and cursor overlay, Dock stacks, Mission Control
-versus the wallpaper-click state, fully transparent windows, desktop windows,
-own windows, modifiers, that the window list is read lazily and only once, and
-the AppKit→CoreGraphics coordinate flip.
+pure function and therefore testable without a window server. 45 tests: the
+cross-display rule itself (same display, single display, straddling windows,
+focus falling back to the topmost window when the frontmost application has
+none, nothing on screen at all), active vs inactive windows, background windows
+of the active and of an inactive application, negative-coordinate secondary
+displays, the menu bar on either display, the Dock strip (ordinary,
+auto-hidden, hidden, and when Accessibility does not answer), the strips a
+full-screen window covers, open menus, floating panels, the Dock backdrop and
+cursor overlay, Dock stacks, notifications (on a banner, beside one, and when
+Notification Center says nothing), Mission Control versus the wallpaper-click
+state, fully transparent windows, desktop windows, own windows, modifiers, the
+cost rules - the window list read lazily and exactly once, and neither the Dock
+nor Notification Center asked unless its own window is over the click - and the
+AppKit→CoreGraphics coordinate flip.
+
+Because the policy now acts only on a click that crosses displays, nearly every
+fixture includes a window of the frontmost application on the *other* display;
+`act(...)` adds one by default. A fixture without it is testing what happens
+when the click does not cross displays.
 
 ```
 xcodebuild -project ClickThrough.xcodeproj -scheme ClickThrough test
@@ -59,6 +69,11 @@ Idle: 0.020 s of CPU over 90 s of wall time, 0.02% of one core, 15 MB
 `phys_footprint`, 10 threads. Per-click debug logging is confirmed absent from
 the release binary - none of the format strings appear in it.
 
+These are from the third round, and the window-server figures include cold
+reads, which is why they are higher than the warm per-call numbers in the fourth
+round below. What changed since: an ordinary click that stays on the display
+that has focus now costs that one query and 1 µs, and nothing else at all.
+
 So one window-server query is ~99.5% of the cost of an ordinary click, and the
 decision logic is 0.5%. That ruled several things in and out:
 
@@ -85,6 +100,167 @@ decision logic is 0.5%. That ruled several things in and out:
 - **Dropping mouse-up and mouse-dragged from the tap's mask** - rejected. They
   cost ~1 µs each and are what keeps a held mouse-down from being overtaken by
   the events that follow it.
+
+## Fourth round: narrowing the scope to clicks that cross displays
+
+Two things prompted this round. A click on a notification's close button was
+being pushed through to the window behind the notification; and that was the
+fourth bug of the same shape - a system surface drawn into a window covering a
+whole display, which the targeting rule looks past. The fix for the shape, not
+just the instance, was to stop acting on clicks that do not cross displays at
+all.
+
+### The mechanism behind the notification bug
+
+`CGWindowListCopyWindowInfo` with a banner on screen:
+
+```
+id=67  pid=741  layer=21  Notification Center  x=0 y=0 w=1512 h=982
+```
+
+One window over the whole display, at a level above ordinary windows, owned by a
+process that never becomes frontmost - the Dock's problem exactly. The banner
+itself occupies 344x58 of it. Clicking the close button therefore activated
+whatever window lay under the rest of that window.
+
+Opening the notification panel from the clock produces the same window. Control
+Center, checked at the same time, does *not*: it opens a 656x967 window at level
+101, which the existing open-menu rule already covers.
+
+Where the banner actually is, from Notification Center's Accessibility
+hierarchy - and it agrees with the system hit test, `AXUIElementCopyElement`
+`AtPosition` at a point inside it returning the banner and at a point 12pt to
+its left returning the application underneath:
+
+```
+AXWindow/AXSystemDialog                     x=0    y=0  w=1512 h=982
+  AXGroup/AXHostingView                     x=0    y=0  w=1512 h=982
+    AXGroup                                 x=760  y=0  w=752  h=868
+      AXScrollArea                          x=760  y=0  w=752  h=868
+        AXGroup/AXNotificationCenterBanner  x=1152 y=49 w=344  h=58
+```
+
+The close button is not exposed as an element of its own; it is drawn inside the
+banner's rectangle, which is why taking the banner is enough. Only geometry is
+read - no titles, no descriptions.
+
+### Where notifications appear, which decides whether the scope change alone was enough
+
+It was not. With focus on the secondary display, a notification still appears on
+the primary one, so a click on it crosses displays and reaches the policy:
+
+```
+focus on the secondary display (a window activated there)
+notification window: x=0 y=0 w=1512 h=982     <- the primary display
+```
+
+So both fixes were needed: the cross-display rule, and asking Notification
+Center where it is drawing.
+
+### The test rig
+
+Three scratch applications, each an unbundled AppKit binary:
+
+* `harness <label> <screen> <seconds> <slot>` - a window on a chosen display
+  whose view reports on stdout when it receives a `mouseDown`. Its view does not
+  accept the first mouse, so an inactive window swallows the activating click -
+  which is exactly the wasted click being measured. Slot 2 covers the whole
+  display, for putting a window under a notification.
+* `twin <label> <seconds>` - one application with a window on *every* display:
+  the shape of the problem case (a browser with a window per screen).
+* `click`, `move`, `front`, `dump`, `above`, `nc`, `at` - synthetic click and
+  pointer moves, the frontmost application, the window list, what the window
+  server reports *above* a given window, Notification Center's hierarchy, and
+  the system-wide element at a point.
+
+A trap worth recording: `harness` originally did not call
+`NSApp.activate(ignoringOtherApps:)`, and a window ordered front by an inactive
+application stays *behind* the active application's windows. It was in the
+on-screen window list at the right coordinates and every click on it went to the
+editor covering the display instead. `CGWindowListCopyWindowInfo` with
+`.optionOnScreenAboveWindow` is the way to check this rather than eyeballing the
+front-to-back list.
+
+### Click delivery, measured
+
+Same script, three configurations. "Delivered" means the window's view received
+the `mouseDown`, not merely that the application came forward.
+
+| click | ClickThrough stopped | 1.2.1 | 1.3.0 |
+|---|---|---|---|
+| inactive window, same display as focus | no | **yes** | no |
+| inactive window, another display | no | yes | **yes** |
+| window that is already active | yes | yes | yes |
+
+The middle row is the deliberate change: within one display the utility now
+behaves exactly as if it were not running. The bottom two rows are what had to
+keep working.
+
+### The notification fix, measured
+
+Focus on the secondary display, a window of `harness A` covering the primary
+display, a notification posted, the pointer moved onto the banner and its close
+button clicked. The two arms differ only in whether the policy is given
+Notification Center's rectangles:
+
+| | harness A activated by the click | notification dismissed |
+|---|---|---|
+| Notification Center rule disabled | **yes** - the reported bug | yes |
+| 1.3.0 | no | yes |
+
+Since nothing else in the policy would leave that click alone, "not activated"
+is also proof that the shipping walk really does find the live banner.
+
+### Focusing is not raising
+
+Found while checking that the multi-display fix still held. With `twin` - one
+application, a window on each display - the cross-display click was *not*
+delivered, and the debug log said why:
+
+```
+activate pid=17197 window=1808 raise=true at (1070.0, -394.0)
+activate: target not ready within budget (frontmost: true)
+```
+
+The application became frontmost but never made the clicked window its focused
+window, so AppKit discarded the click. `AXRaise` only changes the z-order;
+Chrome treats being raised as being focused and an ordinary AppKit application
+does not, which is why eight rounds of measurement against a browser never
+showed it. It was not a regression - 1.2.1, rebuilt from its own commit in a
+worktree and installed, failed identically.
+
+Setting `kAXMain` and `kAXFocused` on the clicked window fixed it, but only
+4 times in 5: activation is asynchronous, so the application can focus its own
+last-used window *after* being asked for the clicked one, and every failure
+coincided with the budget expiring. Re-asserting the request every 30 ms while
+waiting closed it.
+
+| | clicks delivered | wait budget exceeded |
+|---|---|---|
+| raise only (1.2.1 and 1.3.0 before this) | 0 / 3 | 3 / 3 |
+| raise + focus, asked once | 4 / 5 | 1 / 5 |
+| raise + focus, re-asserted every 30 ms | **12 / 12** | 0 / 12 |
+
+The displaced-window restore was ruled out as the cause on the way - disabling
+it changed nothing about delivery, and confirmed it is still doing its job: with
+it disabled the two-display application's other window jumped over the window
+that had focus, and with it enabled that window stayed on top.
+
+### Cost after the change
+
+Policy function against a live 10-window, 2-display list:
+
+| | per call |
+|---|---|
+| Window-list read (`CGWindowListCopyWindowInfo`, warm) | 288 µs |
+| Policy, click on the display that has focus | 1.1 µs |
+| Policy, click that crosses displays | 6.0 µs |
+| Policy, ⌘-click (decided before the list is read) | 0.0 µs |
+
+The everyday click is now the first of those: one window-server read, no
+Accessibility round trip to any other process, no activation, nothing held. The
+scope change is the largest saving made so far - it removed 13-40 ms of blocking
+work from every same-display click on an inactive window.
 
 ## Third round: the multi-display case the utility was actually for
 
@@ -283,11 +459,15 @@ did simply activating and returning the original event, which is strictly safer.
 ## Manual checklist
 
 Put an inactive window on a second display, then click directly on a control.
+Two displays are required for any of this: a click that stays on the display
+that has focus is deliberately left to macOS.
 
 Basic
 - [ ] Click on an already-active window behaves normally
-- [ ] Click on an inactive window performs the action immediately
-- [ ] Same, with the inactive window on another display
+- [ ] Click on an inactive window **on another display** performs the action
+      immediately
+- [ ] Click on an inactive window on the display that already has focus behaves
+      exactly as it does with the utility disabled - this is intended
 - [ ] Displays with different resolutions / scale factors
 - [ ] Displays arranged vertically and at odd offsets
 - [ ] Toggling Enabled off restores stock macOS behaviour, on restores interception
@@ -304,6 +484,10 @@ Must not misbehave
 - [ ] Menu bar menus open and dismiss normally, on either display
 - [ ] Dock clicks behave normally - ordinary, auto-hidden, and on the left or right edge
 - [ ] Dock stacks: clicking a file in the fan selects it; dragging one out works
+- [ ] A notification banner: clicking its close button dismisses it and does not
+      bring the window behind it forward, including while focus is on another
+      display
+- [ ] The notification panel from the clock, and Control Center
 - [ ] Context menus, sheets, dialogs, popovers
 - [ ] Mission Control
 - [ ] Clicking the wallpaper, then clicking a window again

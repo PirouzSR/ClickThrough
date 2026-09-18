@@ -26,11 +26,14 @@ enum ClickAction: Equatable {
 
 enum IgnoreReason: String, Equatable {
     case modifierHeld
+    case sameDisplay
+    case focusDisplayUnknown
     case systemUIFrontmost
     case systemUIOnScreen
     case menuOpen
     case menuBarOrDock
     case noWindowUnderCursor
+    case notificationContent
     case overlayWindow
     case ownApplication
     case alreadyFrontWindow
@@ -52,9 +55,11 @@ enum WindowFinder {
     static let windowManagerOwnerName = "WindowManager"
     static let nonTargetOwners: Set<String> = [windowServerOwnerName, windowManagerOwnerName]
 
-    /// `kCGWindowOwnerName` for the Dock. This is the process name, not a
-    /// localised display name, so it is stable across languages.
+    /// `kCGWindowOwnerName` for the Dock and for Notification Center. These are
+    /// process names, not localised display names, so they are stable across
+    /// languages.
     static let dockOwnerName = "Dock"
+    static let notificationCenterOwnerName = "Notification Center"
 
     /// Applications that, when frontmost, mean the system is showing its own UI
     /// (a Dock menu, the login window, a screen saver). Clicking through to an
@@ -116,6 +121,8 @@ enum WindowFinder {
     ///   - dockState: asks the Dock what it is showing. Injected so that the
     ///     whole policy stays a pure function, and only consulted for a click
     ///     that would otherwise activate something.
+    ///   - notificationRects: asks Notification Center where it is drawing,
+    ///     under the same terms.
     static func action(for point: CGPoint,
                        windows: () -> [WindowSnapshot],
                        frontmostPID: pid_t,
@@ -123,7 +130,8 @@ enum WindowFinder {
                        screens: [ScreenInfo],
                        ownPID: pid_t,
                        modifiers: CGEventFlags,
-                       dockState: (pid_t) -> DockState? = { _ in nil }) -> ClickAction {
+                       dockState: (pid_t) -> DockState? = { _ in nil },
+                       notificationRects: (pid_t, CGRect) -> [CGRect] = { _, _ in [] }) -> ClickAction {
         // Command-click and control-click already have their own meanings on an
         // inactive window (move it without activating; open a context menu), so
         // they are passed through untouched.
@@ -138,6 +146,35 @@ enum WindowFinder {
         // Everything from here needs to know what is on screen. Reading that is
         // ~1 ms, so it is deliberately not read for the two rules above.
         let windows = windows()
+        let displays = screens.map(\.frame)
+
+        // The click this utility exists for is the one that crosses displays:
+        // the window you clicked is on a different screen from the one that has
+        // focus, so macOS spends your click on moving focus there instead of on
+        // the thing you clicked.
+        //
+        // macOS discards that first click within a single display too, and this
+        // deliberately no longer does anything about it. Every intervention is a
+        // chance to get a click wrong, and the repeated way to get one wrong is a
+        // system surface painted into a window that covers a whole display - a
+        // notification and its close button, a Dock stack, something this code
+        // has never seen - which the targeting below looks straight past, so the
+        // click lands on the window behind it instead. That list is not fixed:
+        // it is whatever this version of macOS happens to do. Standing aside for
+        // clicks that stay on the focused display removes most of that risk
+        // without having to keep the list complete, at the price of leaving the
+        // smaller annoyance - the window you wanted is on the screen you are
+        // already looking at - to macOS. It also means a single-display setup
+        // never sees this utility do anything at all.
+        guard let clickedDisplay = display(containing: point, in: displays) else {
+            // Between or beyond the displays: there is no window there either.
+            return .ignore(.noWindowUnderCursor)
+        }
+        guard let focusedDisplay = focusDisplay(frontmostPID: frontmostPID,
+                                                windows: windows, displays: displays) else {
+            return .ignore(.focusDisplayUnknown)
+        }
+        guard clickedDisplay != focusedDisplay else { return .ignore(.sameDisplay) }
 
         // Mission Control. It is owned by `WindowManager`, and - measured on
         // macOS 27 - it does *not* become the frontmost application, so the check
@@ -154,7 +191,7 @@ enum WindowFinder {
         // again. Missing an unusual Mission Control simply leaves the old
         // behaviour; a false positive here looks like the utility is dead, so the
         // test deliberately errs towards missing one.
-        if isMissionControlOnScreen(windows, displays: screens.map(\.frame)) {
+        if isMissionControlOnScreen(windows, displays: displays) {
             return .ignore(.systemUIOnScreen)
         }
 
@@ -162,8 +199,6 @@ enum WindowFinder {
         // gesture. Activating whatever sits under the pointer would raise a window
         // the user never meant to touch.
         if windows.contains(where: { $0.layer == popUpMenuLayer }) { return .ignore(.menuOpen) }
-
-        let displays = screens.map(\.frame)
 
         // The menu bar, wherever it is currently being drawn. This comes from the
         // window list rather than from `NSScreen.visibleFrame` because macOS
@@ -196,7 +231,7 @@ enum WindowFinder {
         // rule above deliberately looks past, and the Dock is not frontmost for
         // either. Asking the Dock is the only way to tell a click on it from a
         // click on the window behind it. See `DockInspector`.
-        if let dock = dockBackdrop(at: point, in: windows, displays: displays) {
+        if let dock = backdrop(ownedBy: dockOwnerName, at: point, in: windows, displays: displays) {
             if let state = dockState(dock.pid) {
                 if state.strip.contains(point) { return .ignore(.menuBarOrDock) }
                 if state.showsStack { return .ignore(.dockStackOpen) }
@@ -206,6 +241,18 @@ enum WindowFinder {
                 // reserves, which is right for the ordinary always-visible Dock.
                 return .ignore(.menuBarOrDock)
             }
+        }
+
+        // Notification Center draws a banner - and the whole notification panel
+        // - into a window covering its display, in exactly the way the Dock
+        // does, so the same question has to be asked of it: is this click on a
+        // notification, or on the window behind one? Clicking a notification's
+        // close button and having the window underneath come forward instead was
+        // the reported symptom. See `NotificationCenterInspector`.
+        if let centre = backdrop(ownedBy: notificationCenterOwnerName, at: point,
+                                 in: windows, displays: displays),
+           notificationRects(centre.pid, centre.bounds).contains(where: { $0.contains(point) }) {
+            return .ignore(.notificationContent)
         }
 
         // Raising is only needed when the click landed on a window that is not
@@ -283,17 +330,53 @@ enum WindowFinder {
         }
     }
 
-    /// The Dock's full-display window, when it is on screen and covers `point`.
+    /// A named process's full-display window, when it is on screen and covers
+    /// `point`. Used for the Dock and for Notification Center, the two system
+    /// surfaces that have to be asked about their own clicks.
     ///
-    /// Its process identifier is what `DockInspector` needs, and taking it from
-    /// the window list means the Dock never has to be looked up by bundle
+    /// Its process identifier is what the inspectors need, and taking it from
+    /// the window list means neither process has to be looked up by bundle
     /// identifier on the event-tap thread.
-    private static func dockBackdrop(at point: CGPoint,
-                                     in windows: [WindowSnapshot],
-                                     displays: [CGRect]) -> WindowSnapshot? {
+    private static func backdrop(ownedBy owner: String, at point: CGPoint,
+                                 in windows: [WindowSnapshot],
+                                 displays: [CGRect]) -> WindowSnapshot? {
         windows.first {
-            $0.ownerName == dockOwnerName && isBackdrop($0, displays: displays) && $0.bounds.contains(point)
+            $0.ownerName == owner && isBackdrop($0, displays: displays) && $0.bounds.contains(point)
         }
+    }
+
+    /// The display containing `point`, if any.
+    private static func display(containing point: CGPoint, in displays: [CGRect]) -> CGRect? {
+        displays.first { $0.contains(point) }
+    }
+
+    /// The display that currently holds focus.
+    ///
+    /// That is wherever the frontmost application's front window is. When the
+    /// frontmost application has no window on screen - Finder, after a click on
+    /// the desktop, is the everyday case - the top-most window of any
+    /// application is the best answer available, and still says which display
+    /// the user was working on. With nothing on screen at all there is no answer,
+    /// and the click is left alone.
+    private static func focusDisplay(frontmostPID: pid_t, windows: [WindowSnapshot],
+                                     displays: [CGRect]) -> CGRect? {
+        guard let focused = frontWindow(ofPID: frontmostPID, in: windows)
+                ?? windows.first(where: { $0.layer == 0 && $0.alpha > 0 })
+        else { return nil }
+        return display(mostlyCovering: focused.bounds, in: displays)
+    }
+
+    /// The display a window is on, which for a window straddling two displays is
+    /// the one showing more of it - the same rule macOS itself uses.
+    private static func display(mostlyCovering bounds: CGRect, in displays: [CGRect]) -> CGRect? {
+        let best = displays.max { overlap($0, bounds) < overlap($1, bounds) }
+        guard let best, overlap(best, bounds) > 0 else { return nil }
+        return best
+    }
+
+    private static func overlap(_ display: CGRect, _ bounds: CGRect) -> CGFloat {
+        let intersection = display.intersection(bounds)
+        return intersection.isNull ? 0 : intersection.width * intersection.height
     }
 
     /// The given application's front-most ordinary window, in global z-order.

@@ -19,6 +19,12 @@ enum WindowActivator {
     /// How often to ask the target whether it has become frontmost yet.
     private static let confirmationPollInterval: useconds_t = 2_000
 
+    /// How long to leave an application alone before asking again for the
+    /// clicked window while waiting. Long enough not to flood a settling
+    /// application with round trips, short enough to catch the moment it
+    /// focuses a window of its own choosing.
+    private static let focusReassertInterval: CFTimeInterval = 0.03
+
     /// Tolerance when pairing an Accessibility window with a window-server window.
     /// Measured on macOS: `kAXPosition`/`kAXSize` and `kCGWindowBounds` agree
     /// exactly for standard windows, so this only absorbs rounding.
@@ -72,14 +78,15 @@ enum WindowActivator {
         let element = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
 
-        // The clicked window has to be raised twice: once before activating, so
-        // that it is the window activation brings forward, and once after,
-        // because activation makes the application focus and raise *its own*
-        // last-used window and throw the first raise away. Measured on macOS
-        // with a browser holding a window on each display: without the second
-        // raise the clicked window is not the focused one when the mouse-down is
-        // released and the click is swallowed exactly as if this utility were
-        // not running - 0 clicks delivered out of 8, against 8 out of 8 with it.
+        // The clicked window has to be given to the application twice: once
+        // before activating, so that it is the window activation brings forward,
+        // and once after, because activation makes the application focus and
+        // raise *its own* last-used window and throw the first attempt away.
+        // Measured on macOS with a browser holding a window on each display:
+        // without the second one the clicked window is not the focused one when
+        // the mouse-down is released and the click is swallowed exactly as if
+        // this utility were not running - 0 clicks delivered out of 8, against
+        // 8 out of 8 with it.
         //
         // Finding the window costs an Accessibility round trip per window of
         // that application, so it is found once and reused rather than searched
@@ -87,7 +94,7 @@ enum WindowActivator {
         // a browser with two windows. Reusing the element is also more accurate,
         // because an element keeps referring to the same window even if it moves.
         let target = raiseWindow ? window(matching: windowBounds, in: element, deadline: deadline) : nil
-        if let target { AXUIElementPerformAction(target, kAXRaiseAction as CFString) }
+        if let target { raiseAndFocus(target) }
 
         if !app.activate(options: []) {
             // Rare: the request was refused. Fall back to asking the application
@@ -96,10 +103,29 @@ enum WindowActivator {
             Log.debug("activate: NSRunningApplication refused, AXFrontmost -> \(result.rawValue)")
         }
 
-        if let target { AXUIElementPerformAction(target, kAXRaiseAction as CFString) }
+        if let target { raiseAndFocus(target) }
 
-        waitUntilReady(element, windowBounds: windowBounds, deadline: deadline)
+        waitUntilReady(element, target: target, windowBounds: windowBounds, deadline: deadline)
         restore(displaced)
+    }
+
+    /// Puts a window on top of its application's own windows *and* makes it the
+    /// window that application has focused.
+    ///
+    /// Both halves are needed. Raising only changes the z-order: for an
+    /// application holding a window on each display - the whole case this
+    /// utility exists for - the application still has its last-used window
+    /// focused, and AppKit throws away a click that arrives at a window which is
+    /// not the focused one, exactly as if this utility were not running.
+    /// Measured on a two-window AppKit application with a window on each
+    /// display: 0 clicks delivered out of 3 with the raise alone. Browsers were
+    /// unaffected either way - they treat being raised as being focused - which
+    /// is why this only surfaced once the case was tried with an ordinary AppKit
+    /// application rather than with Chrome.
+    private static func raiseAndFocus(_ window: AXUIElement) {
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
     /// Windows that activating `targetPID` is likely to cover up, and should not.
@@ -174,9 +200,17 @@ enum WindowActivator {
     /// clicked. Releasing the mouse-down then delivers it to a window that is not
     /// focused, and it is swallowed exactly as before. Measured on macOS: waiting
     /// only for frontmost delivered 0 clicks out of 8 in that setup.
-    private static func waitUntilReady(_ element: AXUIElement, windowBounds: CGRect,
-                                       deadline: CFTimeInterval) {
+    ///
+    /// - Parameter target: the clicked window, re-asserted while waiting. The
+    ///   request made before this point can simply be lost: activation is
+    ///   asynchronous, so an application can focus its own last-used window
+    ///   *after* being asked for the clicked one. Measured on a two-window
+    ///   AppKit application, asking once lost that race about one click in five;
+    ///   asking again while waiting took it to 12 out of 12.
+    private static func waitUntilReady(_ element: AXUIElement, target: AXUIElement?,
+                                       windowBounds: CGRect, deadline: CFTimeInterval) {
         var sawFrontmost = false
+        var nextReassert = CFAbsoluteTimeGetCurrent() + focusReassertInterval
         while CFAbsoluteTimeGetCurrent() < deadline {
             if !sawFrontmost {
                 var value: CFTypeRef?
@@ -185,7 +219,14 @@ enum WindowActivator {
                     sawFrontmost = true
                 }
             }
-            if sawFrontmost, focusedWindowMatches(windowBounds, in: element) { return }
+            if sawFrontmost {
+                if focusedWindowMatches(windowBounds, in: element) { return }
+                let now = CFAbsoluteTimeGetCurrent()
+                if let target, now >= nextReassert {
+                    raiseAndFocus(target)
+                    nextReassert = now + focusReassertInterval
+                }
+            }
             usleep(confirmationPollInterval)
         }
         Log.debug("activate: target not ready within budget (frontmost: \(sawFrontmost))")
@@ -197,29 +238,11 @@ enum WindowActivator {
         guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let window = value, CFGetTypeID(window) == AXUIElementGetTypeID()
         else { return false }
-        guard let frame = frame(of: window as! AXUIElement) else { return false }
+        guard let frame = (window as! AXUIElement).frame else { return false }
         return abs(frame.minX - bounds.minX) <= frameMatchTolerance
             && abs(frame.minY - bounds.minY) <= frameMatchTolerance
             && abs(frame.width - bounds.width) <= frameMatchTolerance
             && abs(frame.height - bounds.height) <= frameMatchTolerance
-    }
-
-    /// An Accessibility window's frame, in one round trip.
-    private static func frame(of window: AXUIElement) -> CGRect? {
-        var values: CFArray?
-        let attributes = [kAXPositionAttribute, kAXSizeAttribute] as CFArray
-        guard AXUIElementCopyMultipleAttributeValues(window, attributes, [], &values) == .success,
-              let pair = values as? [AnyObject], pair.count == 2,
-              CFGetTypeID(pair[0]) == AXValueGetTypeID(), CFGetTypeID(pair[1]) == AXValueGetTypeID()
-        else { return nil }
-        let position = pair[0] as! AXValue
-        let size = pair[1] as! AXValue
-        guard AXValueGetType(position) == .cgPoint, AXValueGetType(size) == .cgSize else { return nil }
-        var origin = CGPoint.zero
-        var extent = CGSize.zero
-        AXValueGetValue(position, .cgPoint, &origin)
-        AXValueGetValue(size, .cgSize, &extent)
-        return CGRect(origin: origin, size: extent)
     }
 
     /// The target application's Accessibility window whose frame matches the
@@ -246,7 +269,7 @@ enum WindowActivator {
                 return nil
             }
             // One round trip per window instead of two.
-            guard let r = frame(of: window) else { continue }
+            guard let r = window.frame else { continue }
 
             if abs(r.minX - bounds.minX) <= frameMatchTolerance,
                abs(r.minY - bounds.minY) <= frameMatchTolerance,

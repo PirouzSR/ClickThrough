@@ -1,11 +1,20 @@
 # ClickThrough
 
-A menu bar utility that stops macOS wasting the first click on an inactive window.
+A menu bar utility that stops macOS wasting the first click when you click from
+one display onto another.
 
-Normally, clicking a control in a window that is not the active window only
-activates that window; the click itself is discarded and you have to click
-again. ClickThrough activates the window's application *before* the click is
-delivered, so the click lands where you aimed it. One physical click, one action.
+Normally, clicking a control in a window on your other monitor only moves focus
+there; the click itself is discarded and you have to click again. ClickThrough
+activates the window's application *before* the click is delivered, so the click
+lands where you aimed it. One physical click, one action.
+
+**Only clicks that cross displays are touched.** A click that stays on the
+display that already has focus is left entirely to macOS, and on a single-display
+Mac the utility does nothing at all. That is deliberate: the wasted click is
+worst when it crosses monitors, and every intervention risks getting a click
+wrong — pushing it through to the window behind a notification, a Dock stack, or
+some system surface drawn into a window that covers the whole screen. Narrow
+scope, no surprises. See [Deliberate non-interference](#deliberate-non-interference).
 
 It is **not** focus-follows-mouse: moving the pointer over a window does nothing.
 Only an actual click activates anything.
@@ -60,20 +69,24 @@ There are no other settings.
 
 A `CGEventTap` watches left mouse-down. For each one:
 
-1. Read the on-screen window list (front to back) and find the topmost ordinary
-   window under the pointer.
-2. If that window's application is already frontmost and the window is already
-   its front window, do nothing.
-3. Otherwise activate that application — raising the specific clicked window
-   first if it is not already that application's front window — wait until the
-   application reports that it really is frontmost, and then return **the
-   original event, unmodified**.
+1. Read the on-screen window list, front to back.
+2. Work out which display the click is on, and which display has focus — the one
+   holding the frontmost application's front window. **If they are the same
+   display, do nothing.** This is the majority of clicks and they cost one
+   window-list read and 1 µs of arithmetic.
+3. Otherwise find the topmost ordinary window under the pointer. If it is
+   already its application's front window and that application is already
+   frontmost, do nothing.
+4. Otherwise activate that application — raising and focusing the specific
+   clicked window — wait until the application reports that the clicked window
+   really is its focused window, and then return **the original event,
+   unmodified**.
 
 The application therefore receives the user's real click at a moment when it is
 already active, so AppKit delivers it to the view instead of swallowing it as an
 activation click.
 
-Step 3 has to do three things, not one, and each was found the hard way.
+Step 4 has to do four things, not one, and each was found the hard way.
 
 **Wait, do not just ask.** `activate()` only *requests* activation; if the held
 mouse-down is released before the application has actually become active,
@@ -88,12 +101,22 @@ alone at 1000 ms and disabled it at 1500 ms.
 settling. What matters is that the *clicked window* is the one the application
 has focused, so that is what is waited for.
 
-**Raise the clicked window again afterwards.** Activating an application makes
-it focus and raise its own last-used window, which throws away any raise
-performed beforehand. For an application with a window on each display that
-window is on the *other* display, so before this the clicked window was not
+**Ask for the clicked window again afterwards, and keep asking.** Activating an
+application makes it focus and raise its own last-used window, which throws away
+anything asked for beforehand. For an application with a window on each display
+that window is on the *other* display, so before this the clicked window was not
 focused when the click was released and the click was lost - measured at 0 out
-of 8 for a browser in that arrangement, the same as not running at all.
+of 8 for a browser in that arrangement, the same as not running at all. And
+because activation is asynchronous, the application can do that *after* being
+asked, so the request is repeated every 30 ms until it sticks: without repeating
+it, a two-window AppKit application lost about one click in five.
+
+**Focusing is not the same as raising.** `AXRaise` only changes the z-order. A
+browser treats being raised as being focused, but an ordinary AppKit application
+does not: it keeps its last-used window focused, and AppKit throws away a click
+that arrives at a window that is not the focused one. So the clicked window is
+also asked to become the application's main and focused window - 0 clicks out of
+3 delivered without that, 12 out of 12 with it and with the repeat above.
 
 **Put back what the activation displaced.** Activation raises an application's
 windows on every display, not only the one being clicked, so a window the user
@@ -121,8 +144,8 @@ Measured on an M-series laptop with two displays, with the shipping build:
 | | |
 |---|---|
 | Idle | 0.020 s of CPU per 90 s - 0.02% of one core - and 15 MB of memory |
-| A click that needs no action | ~1 ms, essentially all of it one window-server query |
-| The policy decision itself | 5 µs |
+| A click on the display that already has focus | 0.3 ms: one window-server query, then 1 µs to decide |
+| A click that crosses displays but needs no action | 0.3 ms, and 6 µs to decide |
 | A click that activates another application | 13-40 ms, almost all of it waiting for that application to be ready |
 | Each event of a drag | ~1 µs |
 
@@ -130,7 +153,11 @@ Two things follow from that shape. The window-server query is the whole cost of
 an ordinary click, so it is read lazily: a ⌘-click or ⌃-click, or a click while
 the system is showing its own UI, is decided without reading it at all and costs
 0.1 ms. And micro-optimising the decision logic would be pointless, because at
-5 µs it is already 0.5% of the work.
+1-6 µs it is already under 2% of the work.
+
+Restricting the utility to clicks that cross displays is itself the largest
+saving there has been: the everyday click now asks nothing of any other process
+and activates nothing, so it costs the window-list read and no more.
 
 The wait for a slow application is the one unavoidable cost, and it is bounded:
 200 ms, against a measured event-tap limit of 1000-1500 ms.
@@ -139,6 +166,10 @@ The wait for a slow application is the one unavoidable cost, and it is bounded:
 
 A click is passed through untouched when:
 
+* **It does not cross displays.** If the click is on the display that already
+  holds focus, macOS handles it exactly as it always has. This is the first rule
+  and it decides most clicks - see the note below on why the scope is drawn
+  there.
 * **Command or Control is held.** ⌘-click already means "interact without
   activating" and ⌃-click means "context menu"; both are left to macOS.
 * **A menu is open anywhere** (any window at the pop-up-menu level). A click
@@ -150,6 +181,9 @@ A click is passed through untouched when:
   off the bottom of the display while it is hidden.
 * **The Dock is showing a stack** — the fan or grid from a folder in the Dock.
   A click then belongs to the stack, not to whatever is behind the Dock.
+* **The pointer is on a notification**, taken from the rectangles Notification
+  Center reports for the banners and panel content it is drawing. A click on a
+  notification — its close button above all — belongs to the notification.
 * **The frontmost application is system UI** — a Dock menu, the login window or
   a screen saver — **or Mission Control is on screen**, which does not become
   frontmost and so has to be recognised from its own windows.
@@ -158,20 +192,29 @@ A click is passed through untouched when:
 * The window belongs to ClickThrough itself, or to a process that cannot be
   activated.
 
-Three window-server details the targeting has to allow for, all observed on
+Four window-server details the targeting has to allow for, all observed on
 macOS 27:
 
-* **The Dock and Notification Centre each keep a window covering an entire
+* **The Dock and Notification Center each keep a window covering an entire
   display** above ordinary windows, and **the mouse pointer is itself a window**,
   directly under the cursor at all times. Treating any of those as "the window
   you clicked" would make the utility a silent no-op — intermittently, in
-  Notification Centre's case. Any window above the ordinary level that spans a
+  Notification Center's case. Any window above the ordinary level that spans a
   whole display is therefore treated as a backdrop and looked through.
-* Looking through the Dock's backdrop is also why the Dock has to be asked about
-  its own clicks: everything it draws, the row of icons and any open stack
-  alike, lives inside that one window, and it never becomes frontmost. It is
-  only asked for a click that would otherwise activate something, and only when
-  its window covers that click — about 0.1 ms.
+* Looking through those backdrops is also why the Dock and Notification Center
+  have to be asked about their own clicks. Everything the Dock draws — the row
+  of icons and any open stack — lives inside its one window, and everything
+  Notification Center draws — a banner, its close button, the whole notification
+  panel — lives inside its one window, and neither process ever becomes
+  frontmost. Nothing else can tell a click on one of those from a click on the
+  window behind it. Each is asked only for a click that would otherwise activate
+  something, and only when its own window covers that click.
+* Which is the second reason the scope is drawn at display boundaries. That
+  pattern — a system surface painted into a window the size of the screen — is
+  not a fixed list: it is whatever this version of macOS happens to do, and each
+  instance of it that goes unrecognised is a click pushed through to the window
+  behind. Ignoring every click that stays on the focused display removes most of
+  that surface area outright, rather than needing the list to be complete.
 * **`NSScreen.visibleFrame` reserves the menu bar and Dock strips permanently**,
   on every display, whether or not either is on screen. A full-screen window
   covers those strips, and a video player puts its controls exactly there, so
@@ -179,13 +222,24 @@ macOS 27:
 
 ### Multiple displays
 
+Displays are the whole subject: a click is acted on only when it lands on a
+different display from the one that holds focus. "The display that holds focus"
+means the one showing the frontmost application's front window — or, when the
+frontmost application has no window on screen at all, which is what Finder looks
+like after a click on the desktop, the one showing whatever window is topmost. A
+window straddling two displays counts as being on the one showing more of it.
+
+With one display connected, those two are always the same display and the
+utility never acts. It still runs, and starts working the moment a second
+display is attached.
+
 All geometry is handled in Core Graphics global coordinates — the same space
 used by both `CGEvent.location` and `kCGWindowBounds`. Displays at negative
 offsets, different resolutions and different scale factors therefore need no
 special handling. The display layout is re-read on screen-configuration changes
 and on wake; the parts that move without one — which display is showing the
-menu bar, where the Dock is — are read per click from the window server and the
-Dock rather than cached.
+menu bar, where the Dock is, where focus is — are read per click from the window
+server rather than cached.
 
 ## Permissions
 
@@ -206,6 +260,9 @@ granted, which it notices within a couple of seconds without needing a restart.
 
 ## Known limitations
 
+* **A click that does not cross displays is still wasted**, exactly as on a
+  stock Mac, and on a single-display Mac nothing is ever intercepted. That is
+  the deliberate scope described at the top, not an oversight.
 * **Applications that explicitly discard clicks received while inactive** cannot
   be fixed this way, because the decision happens inside that app after the
   event is delivered. Pre-activation handles every standard AppKit view tested.
@@ -215,6 +272,11 @@ granted, which it notices within a couple of seconds without needing a restart.
   during Mission Control would go back to activating the window under the
   pointer rather than being left alone — the check errs towards missing Mission
   Control, because the opposite mistake would look like the utility was dead.
+* **Notifications are recognised from Notification Center's own Accessibility
+  hierarchy**, which is not a documented contract. If a future macOS rearranges
+  it, a click on a notification on a display that does not have focus would go
+  back to activating the window behind it. That check also errs towards missing
+  notifications rather than over-claiming a region of the screen.
 
 ## Building and Gatekeeper
 
@@ -292,7 +354,10 @@ ClickThrough/
   ClickThroughController.swift  owns the tap, caches what the hot path needs
   EventTap.swift              tap lifecycle on its own thread, re-arming
   WindowFinder.swift          window under cursor + the pass/activate policy
-  WindowActivator.swift       activation and window raising
+  WindowActivator.swift       activation, window raising and focusing
+  DockInspector.swift         asks the Dock where its strip and stacks are
+  NotificationCenterInspector.swift  asks Notification Center where it is drawing
+  AXUIElement+Frame.swift     one-round-trip frame of an Accessibility element
   ScreenGeometry.swift        display layout in CG coordinates
   StatusBarController.swift   the menu bar item
   AccessibilityManager.swift  permission state
