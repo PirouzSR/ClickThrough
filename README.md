@@ -24,7 +24,7 @@ Only an actual click activates anything.
 Download the latest `.dmg` from [Releases](https://github.com/PirouzSR/ClickThrough/releases/latest),
 open it and drag **ClickThrough** to Applications. That build is ad-hoc signed
 and not notarized, so the first launch needs right-click › **Open** › Open.
-It is Apple silicon only; on Intel, build from source.
+It is a universal binary; only Apple silicon has been tested.
 
 To build it yourself instead:
 
