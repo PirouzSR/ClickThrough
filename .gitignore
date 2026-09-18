@@ -3,3 +3,6 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 .DS_Store
+
+# Local signing identity: contains the signer name, so it is not committed.
+.signing-identity

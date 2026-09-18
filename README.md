@@ -109,6 +109,28 @@ runs long — it delivers the "disabled" event only when the *next* event is
 routed, so a tap can sit disabled with no callback coming. A watchdog therefore
 re-arms it every second, which is the longest the utility can stay dead.
 
+
+### What it costs
+
+Measured on an M-series laptop with two displays, with the shipping build:
+
+| | |
+|---|---|
+| Idle | 0.020 s of CPU per 90 s - 0.02% of one core - and 15 MB of memory |
+| A click that needs no action | ~1 ms, essentially all of it one window-server query |
+| The policy decision itself | 5 µs |
+| A click that activates another application | 13-40 ms, almost all of it waiting for that application to be ready |
+| Each event of a drag | ~1 µs |
+
+Two things follow from that shape. The window-server query is the whole cost of
+an ordinary click, so it is read lazily: a ⌘-click or ⌃-click, or a click while
+the system is showing its own UI, is decided without reading it at all and costs
+0.1 ms. And micro-optimising the decision logic would be pointless, because at
+5 µs it is already 0.5% of the work.
+
+The wait for a slow application is the one unavoidable cost, and it is bounded:
+200 ms, against a measured event-tap limit of 1000-1500 ms.
+
 ### Deliberate non-interference
 
 A click is passed through untouched when:
@@ -214,6 +236,42 @@ consequences:
 
 To ship it properly, set a Development Team in the Xcode project and notarize
 the result.
+
+
+### Keeping the Accessibility permission across rebuilds
+
+An ad-hoc signature (`codesign --sign -`) puts the binary's own hash into the
+app's designated requirement:
+
+```
+designated => cdhash H"ce5dd10a…"
+```
+
+macOS therefore treats every rebuild as a different application, and the
+Accessibility permission has to be granted again each time. Signing with any
+code-signing certificate replaces that with a requirement based on the
+certificate, which does not change when the code does:
+
+```
+designated => identifier "com.clickthrough.app" and anchor apple generic and …
+```
+
+To use one:
+
+```
+scripts/setup-signing.sh            # lists the identities available
+scripts/setup-signing.sh 'Apple Development: you@example.com (XXXXXXXXXX)'
+```
+
+Any code-signing identity works, including a self-signed one made in Keychain
+Access (Certificate Assistant → Create a Certificate, type "Code Signing"),
+which keeps an Apple Developer identity out of the installed build. The choice
+is recorded in `.signing-identity`, which is not committed. Rebuild and
+reinstall once, grant the permission one last time, and later rebuilds keep it.
+
+`scripts/build-release.sh` always signs ad-hoc regardless, because a
+certificate-based requirement contains the signer's name and that does not
+belong in a published binary.
 
 ## Uninstall
 

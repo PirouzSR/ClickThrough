@@ -3,14 +3,15 @@
 ## Automated
 
 `ClickThroughTests/WindowFinderTests.swift` covers the click policy, which is a
-pure function and therefore testable without a window server. 32 tests: active
+pure function and therefore testable without a window server. 35 tests: active
 vs inactive windows, background windows of the active and of an inactive
 application, negative-coordinate secondary displays, the menu bar on either
 display, the Dock strip (ordinary, auto-hidden, hidden, and when Accessibility
 does not answer), the strips a full-screen window covers, open menus, floating
 panels, the Dock backdrop and cursor overlay, Dock stacks, Mission Control
 versus the wallpaper-click state, fully transparent windows, desktop windows,
-own windows, modifiers, and the AppKit→CoreGraphics coordinate flip.
+own windows, modifiers, that the window list is read lazily and only once, and
+the AppKit→CoreGraphics coordinate flip.
 
 ```
 xcodebuild -project ClickThrough.xcodeproj -scheme ClickThrough test
@@ -41,6 +42,49 @@ printf '<plist version="1.0"><dict><key>CFBundleExecutable</key><string>ClickThr
 DYLD_FRAMEWORK_PATH=$XCF DYLD_LIBRARY_PATH=/tmp/ct $XC/usr/bin/xctest $B
 ```
 
+
+
+## Performance
+
+Profiled with the shipping engine, 42 clicks and a 200-event drag, on a
+two-display setup:
+
+| | median | p90 | max |
+|---|---|---|---|
+| Window-server query (`CGWindowListCopyWindowInfo`) | 957 µs | 1757 µs | 3194 µs |
+| Policy decision | 5 µs | 6 µs | 27 µs |
+| Drag event pass-through | ~0 µs | 1 µs | 1 µs |
+
+Idle: 0.020 s of CPU over 90 s of wall time, 0.02% of one core, 15 MB
+`phys_footprint`, 10 threads. Per-click debug logging is confirmed absent from
+the release binary - none of the format strings appear in it.
+
+So one window-server query is ~99.5% of the cost of an ordinary click, and the
+decision logic is 0.5%. That ruled several things in and out:
+
+- **Read the window list lazily** - done. A ⌘-click or ⌃-click, and any click
+  while the system is showing its own UI, is decided from the modifier flags and
+  the cached frontmost application alone. Measured afterwards at 0.0-0.1 ms with
+  no query at all, against ~1 ms before. Three unit tests pin this down,
+  including that the list is read exactly once when it *is* needed.
+- **Find the clicked Accessibility window once, not twice** - done. The window
+  has to be raised both before and after activating, and each search costs a
+  round trip per window of that application. Reusing the element took the time
+  spent before the wait from 34-37 ms to 19-22 ms for a browser with two
+  windows. It is also more correct: an element keeps referring to the same
+  window even if it moves, where a second frame match might not.
+- **Hand-rolled CoreFoundation decoding instead of bridging to Swift
+  dictionaries** - measured and rejected. Bridging is only ~33 µs of the query,
+  and a CF version saved ~49 µs, about 5% of a click, in exchange for
+  `unsafeBitCast` throughout the one function that has to be right.
+- **Fusing the policy's several passes over the window list** - rejected. It
+  would save a few microseconds of the 5 µs the policy takes.
+- **Caching the window list between clicks** - rejected. It would save ~1 ms on
+  the second click of a double-click, at the cost of acting on stale geometry,
+  which is exactly the class of bug this utility keeps hitting.
+- **Dropping mouse-up and mouse-dragged from the tap's mask** - rejected. They
+  cost ~1 µs each and are what keeps a held mouse-down from being overtaken by
+  the events that follow it.
 
 ## Third round: the multi-display case the utility was actually for
 

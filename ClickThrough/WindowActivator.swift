@@ -72,13 +72,22 @@ enum WindowActivator {
         let element = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(element, axMessagingTimeout)
 
-        // Raise before activating. Activation brings an application's windows
-        // forward as a group, so raising first guarantees the window the user
-        // actually clicked ends up on top - and becomes key - rather than
-        // whichever window of that app happened to be in front.
-        if raiseWindow {
-            raise(windowWithBounds: windowBounds, in: element, deadline: deadline)
-        }
+        // The clicked window has to be raised twice: once before activating, so
+        // that it is the window activation brings forward, and once after,
+        // because activation makes the application focus and raise *its own*
+        // last-used window and throw the first raise away. Measured on macOS
+        // with a browser holding a window on each display: without the second
+        // raise the clicked window is not the focused one when the mouse-down is
+        // released and the click is swallowed exactly as if this utility were
+        // not running - 0 clicks delivered out of 8, against 8 out of 8 with it.
+        //
+        // Finding the window costs an Accessibility round trip per window of
+        // that application, so it is found once and reused rather than searched
+        // for twice: that took the time spent here from 34-37 ms to 19-22 ms for
+        // a browser with two windows. Reusing the element is also more accurate,
+        // because an element keeps referring to the same window even if it moves.
+        let target = raiseWindow ? window(matching: windowBounds, in: element, deadline: deadline) : nil
+        if let target { AXUIElementPerformAction(target, kAXRaiseAction as CFString) }
 
         if !app.activate(options: []) {
             // Rare: the request was refused. Fall back to asking the application
@@ -87,16 +96,7 @@ enum WindowActivator {
             Log.debug("activate: NSRunningApplication refused, AXFrontmost -> \(result.rawValue)")
         }
 
-        // Raise again, after activating. Measured on macOS with a browser holding
-        // a window on each display: activation makes the application focus and
-        // raise *its own* last-used window, throwing away the raise above. The
-        // clicked window then is not the focused one when the mouse-down is
-        // released, and the click is swallowed exactly as if this utility were
-        // not running - 0 clicks delivered out of 8. Raising once more after
-        // activation took that to 8 out of 8.
-        if raiseWindow {
-            raise(windowWithBounds: windowBounds, in: element, deadline: deadline)
-        }
+        if let target { AXUIElementPerformAction(target, kAXRaiseAction as CFString) }
 
         waitUntilReady(element, windowBounds: windowBounds, deadline: deadline)
         restore(displaced)
@@ -149,8 +149,10 @@ enum WindowActivator {
         for window in displaced {
             let app = AXUIElementCreateApplication(window.pid)
             AXUIElementSetMessagingTimeout(app, axMessagingTimeout)
-            raise(windowWithBounds: window.bounds, in: app,
-                  deadline: CFAbsoluteTimeGetCurrent() + activationBudget)
+            if let w = self.window(matching: window.bounds, in: app,
+                                   deadline: CFAbsoluteTimeGetCurrent() + activationBudget) {
+                AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+            }
         }
     }
 
@@ -220,22 +222,20 @@ enum WindowActivator {
         return CGRect(origin: origin, size: extent)
     }
 
-    /// Finds the target application's Accessibility window whose frame matches the
-    /// window-server bounds, and raises it.
+    /// The target application's Accessibility window whose frame matches the
+    /// window-server bounds.
     ///
     /// Frame matching is used because the public Accessibility API exposes no
     /// window identifier. (`_AXUIElementGetWindow` would provide one directly but
     /// it is private SPI, which this app deliberately avoids.)
-    private static func raise(windowWithBounds bounds: CGRect, in app: AXUIElement, deadline: CFTimeInterval) {
+    private static func window(matching bounds: CGRect, in app: AXUIElement,
+                               deadline: CFTimeInterval) -> AXUIElement? {
         var windowsValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsValue) == .success,
-              let windows = windowsValue as? [AXUIElement] else { return }
+              let windows = windowsValue as? [AXUIElement] else { return nil }
 
         // Single-window applications need no matching at all.
-        if windows.count == 1 {
-            AXUIElementPerformAction(windows[0], kAXRaiseAction as CFString)
-            return
-        }
+        if windows.count == 1 { return windows[0] }
 
         for window in windows {
             // A busy application answers slowly; with many windows the search
@@ -243,7 +243,7 @@ enum WindowActivator {
             // activating the application.
             guard CFAbsoluteTimeGetCurrent() < deadline else {
                 Log.debug("activate: window search ran out of budget")
-                return
+                return nil
             }
             // One round trip per window instead of two.
             guard let r = frame(of: window) else { continue }
@@ -252,9 +252,9 @@ enum WindowActivator {
                abs(r.minY - bounds.minY) <= frameMatchTolerance,
                abs(r.width - bounds.width) <= frameMatchTolerance,
                abs(r.height - bounds.height) <= frameMatchTolerance {
-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-                return
+                return window
             }
         }
+        return nil
     }
 }

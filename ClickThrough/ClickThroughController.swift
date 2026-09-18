@@ -87,7 +87,18 @@ final class ClickThroughController: @unchecked Sendable {
 
     private func handleMouseDown(_ event: CGEvent) {
         let snapshot = environment.withLock { $0 }
-        let windows = WindowFinder.onScreenWindows()
+
+        // Read the window list at most once, and only if the policy asks for it:
+        // that read is a round trip to the window server and is essentially the
+        // whole cost of handling a click.
+        var fetched: [WindowSnapshot]?
+        let windows = { () -> [WindowSnapshot] in
+            if let fetched { return fetched }
+            let list = WindowFinder.onScreenWindows()
+            fetched = list
+            return list
+        }
+
         let action = WindowFinder.action(for: event.location,
                                          windows: windows,
                                          frontmostPID: snapshot.frontmostPID,
@@ -103,7 +114,7 @@ final class ClickThroughController: @unchecked Sendable {
         case .activate(let pid, let windowID, let bounds, let raiseWindow):
             Log.debug("activate pid=\(pid) window=\(windowID) raise=\(raiseWindow) at \(event.location)")
             WindowActivator.activate(pid: pid, windowBounds: bounds, raiseWindow: raiseWindow,
-                                     windows: windows, displays: snapshot.screens.map(\.frame))
+                                     windows: fetched ?? [], displays: snapshot.screens.map(\.frame))
         }
         // The caller returns the original event either way.
     }

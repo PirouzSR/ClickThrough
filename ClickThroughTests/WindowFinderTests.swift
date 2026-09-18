@@ -69,7 +69,7 @@ final class WindowFinderTests: XCTestCase {
                      modifiers: CGEventFlags = [], dockStrip: CGRect = .null,
                      dockShowsStack: Bool = false) -> ClickAction {
         WindowFinder.action(for: point,
-                            windows: windows,
+                            windows: { windows },
                             frontmostPID: frontmostPID ?? frontPID,
                             frontmostIsSystemUI: frontmostIsSystemUI,
                             screens: screens,
@@ -156,7 +156,7 @@ final class WindowFinderTests: XCTestCase {
         let noInset = ScreenInfo(frame: primary.frame, visibleFrame: primary.frame)
         let windows = [primaryMenuBar, dockBackdrop, windowUnderTheDock]
         let action = WindowFinder.action(for: CGPoint(x: 700, y: 950),
-                                        windows: windows,
+                                        windows: { windows },
                                         frontmostPID: frontPID,
                                         frontmostIsSystemUI: false,
                                         screens: [noInset, secondary],
@@ -181,7 +181,7 @@ final class WindowFinderTests: XCTestCase {
     func testDockStripFallsBackToTheReservedInsetWhenTheDockIsSilent() {
         let windows = [primaryMenuBar, dockBackdrop, windowUnderTheDock]
         let action = WindowFinder.action(for: CGPoint(x: 700, y: 950),
-                                        windows: windows,
+                                        windows: { windows },
                                         frontmostPID: frontPID,
                                         frontmostIsSystemUI: false,
                                         screens: screens,
@@ -354,6 +354,54 @@ final class WindowFinderTests: XCTestCase {
         let app = fullWindow(pid: otherPID, id: 2)
         XCTAssertEqual(act(CGPoint(x: 700, y: 500), [app], modifiers: .maskShift),
                        .activate(pid: otherPID, windowID: 2, windowBounds: app.bounds, raiseWindow: false))
+    }
+
+
+    // MARK: - Cost
+
+    /// Reading the on-screen window list is a round trip to the window server and
+    /// is essentially the whole cost of handling a click, so the two rules that
+    /// can decide without it must not trigger the read.
+    func testModifierClickDoesNotReadTheWindowList() {
+        var reads = 0
+        let action = WindowFinder.action(for: CGPoint(x: 700, y: 500),
+                                        windows: { reads += 1; return [self.fullWindow(pid: self.otherPID, id: 2)] },
+                                        frontmostPID: frontPID,
+                                        frontmostIsSystemUI: false,
+                                        screens: screens,
+                                        ownPID: ownPID,
+                                        modifiers: .maskCommand)
+        XCTAssertEqual(action, .ignore(.modifierHeld))
+        XCTAssertEqual(reads, 0)
+    }
+
+    func testSystemUIFrontmostDoesNotReadTheWindowList() {
+        var reads = 0
+        let action = WindowFinder.action(for: CGPoint(x: 700, y: 500),
+                                        windows: { reads += 1; return [self.fullWindow(pid: self.otherPID, id: 2)] },
+                                        frontmostPID: frontPID,
+                                        frontmostIsSystemUI: true,
+                                        screens: screens,
+                                        ownPID: ownPID,
+                                        modifiers: [])
+        XCTAssertEqual(action, .ignore(.systemUIFrontmost))
+        XCTAssertEqual(reads, 0)
+    }
+
+    /// And when it is needed, it is read exactly once however many rules consult it.
+    func testTheWindowListIsReadOnlyOncePerClick() {
+        var reads = 0
+        let app = fullWindow(pid: otherPID, id: 2)
+        let action = WindowFinder.action(for: CGPoint(x: 700, y: 500),
+                                        windows: { reads += 1; return [self.primaryMenuBar, self.dockBackdrop, app] },
+                                        frontmostPID: frontPID,
+                                        frontmostIsSystemUI: false,
+                                        screens: screens,
+                                        ownPID: ownPID,
+                                        modifiers: [],
+                                        dockState: { _ in DockState(strip: self.dockStrip, showsStack: false) })
+        XCTAssertEqual(action, .activate(pid: otherPID, windowID: 2, windowBounds: app.bounds, raiseWindow: false))
+        XCTAssertEqual(reads, 1)
     }
 
     // MARK: - Coordinate conversion

@@ -104,7 +104,10 @@ enum WindowFinder {
     ///
     /// - Parameters:
     ///   - point: click location in CG global coordinates.
-    ///   - windows: on-screen windows, front to back.
+    ///   - windows: on-screen windows, front to back. A closure, not an array,
+    ///     because reading the list costs a round trip to the window server -
+    ///     measured at about a millisecond, which is essentially the whole cost
+    ///     of handling a click - and the first two rules below do not need it.
     ///   - frontmostPID: process that currently owns the menu bar.
     ///   - frontmostIsSystemUI: true when the frontmost app is system UI.
     ///   - screens: current display layout.
@@ -114,7 +117,7 @@ enum WindowFinder {
     ///     whole policy stays a pure function, and only consulted for a click
     ///     that would otherwise activate something.
     static func action(for point: CGPoint,
-                       windows: [WindowSnapshot],
+                       windows: () -> [WindowSnapshot],
                        frontmostPID: pid_t,
                        frontmostIsSystemUI: Bool,
                        screens: [ScreenInfo],
@@ -131,6 +134,10 @@ enum WindowFinder {
         // A Dock menu, the login window or a screen saver: the system has taken
         // over, and clicking through to an application is never what is meant.
         if frontmostIsSystemUI { return .ignore(.systemUIFrontmost) }
+
+        // Everything from here needs to know what is on screen. Reading that is
+        // ~1 ms, so it is deliberately not read for the two rules above.
+        let windows = windows()
 
         // Mission Control. It is owned by `WindowManager`, and - measured on
         // macOS 27 - it does *not* become the frontmost application, so the check

@@ -27,8 +27,30 @@ fi
 cp ClickThrough/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Ad-hoc signature: gives the app a stable identity for the Accessibility
-# permission on this machine. See README for Gatekeeper notes.
-codesign --force --sign - --entitlements ClickThrough/ClickThrough.entitlements --options runtime "$APP"
+# Signing identity. An ad-hoc signature bakes the binary's own hash into the
+# app's designated requirement, so every rebuild looks like a different app to
+# macOS and the Accessibility permission has to be granted all over again. A
+# real signing identity produces a requirement based on the certificate, which
+# survives rebuilds - see scripts/setup-signing.sh.
+#
+# Distribution builds stay ad-hoc on purpose: a certificate-based requirement
+# embeds the signer's name in the app, which has no place in a published binary.
+IDENTITY="-"
+if [[ "${DISTRIBUTION:-0}" != "1" ]]; then
+  if [[ -n "${CLICKTHROUGH_SIGN_IDENTITY:-}" ]]; then
+    IDENTITY="$CLICKTHROUGH_SIGN_IDENTITY"
+  elif [[ -f .signing-identity ]]; then
+    IDENTITY="$(head -1 .signing-identity)"
+  fi
+fi
+
+codesign --force --sign "$IDENTITY" \
+         --entitlements ClickThrough/ClickThrough.entitlements --options runtime "$APP"
+
+if [[ "$IDENTITY" == "-" ]]; then
+  echo "Signed ad-hoc: the Accessibility permission must be re-granted after each rebuild."
+else
+  echo "Signed with: $IDENTITY"
+fi
 
 echo "Built $APP"
