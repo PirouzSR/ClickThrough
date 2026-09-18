@@ -34,6 +34,10 @@ Either way, then:
 4. Done. It registers itself as a login item, so it starts automatically from
    then on.
 
+If you build from source and expect to rebuild, see [Keeping the Accessibility
+permission across rebuilds](#keeping-the-accessibility-permission-across-rebuilds)
+first - otherwise macOS asks for the permission again after every build.
+
 `./scripts/make-dmg.sh` produces `build/ClickThrough.dmg` with a
 drag-to-Applications layout if you prefer to install that way.
 
